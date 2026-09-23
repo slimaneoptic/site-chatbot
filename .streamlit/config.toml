@@ -1,0 +1,20 @@
+[theme]
+base = "light"
+primaryColor = "#1B3A57"
+backgroundColor = "#F7F8FA"
+secondaryBackgroundColor = "#ECEFF3"
+textColor = "#14202B"
+borderColor = "#D5DBE1"
+baseRadius = "6px"
+showSidebarBorder = true
+font = "Archivo:https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700;800&display=swap"
+headingFontWeights = [800, 700, 600]
+
+[server]
+headless = true
+
+[browser]
+gatherUsageStats = false
+
+[client]
+toolbarMode = "viewer"

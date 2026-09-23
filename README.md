@@ -2,11 +2,13 @@
 
 **Live demo:** https://slimaneoptic-chatbot.streamlit.app
 
-Paste a website. It reads the public pages, gives you the clean text as CSV or JSON, and answers questions **only from that site**, with links to the source pages.
+Paste a website or upload PDFs. It answers questions **only from that content** with sources, extracts the fields you name into a table, and gives you the clean text as CSV or JSON.
 
 ![Website chatbot](docs/screenshot.png)
 
 ## Features
+- **Chat with PDFs:** text-based PDFs, cited as "file.pdf, page N".
+- **Extract a table:** type the fields you want ("product, price, in stock"); the AI returns one validated row per item, with the source page.
 - **Polite crawler:** stays inside the given site and folder, follows robots.txt, waits between requests, and caps page size.
 - **Safe for a public demo:** refuses private or internal network addresses, re-checked on every redirect.
 - **Clean extraction:** main text only (menus, footers and ads removed) via trafilatura.

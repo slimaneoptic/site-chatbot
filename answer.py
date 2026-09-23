@@ -47,5 +47,6 @@ def extractive_answer(passages: list[Passage], n: int = 3) -> str:
     for i, p in enumerate(passages[:n], start=1):
         snippet = p.text[:420].rsplit(" ", 1)[0] + ("…" if len(p.text) > 420 else "")
         plain = re.sub(r"([\\`*_{}\[\]<>#+\-!|])", r"\\\1", snippet.replace("\n", " "))  # show text literally
-        parts.append(f"**[{i}] [{p.title}]({p.url})**\n\n> {plain}")
+        ref = f"[{p.title}]({p.url})" if p.url.startswith("http") else p.title
+        parts.append(f"**[{i}] {ref}**\n\n> {plain}")
     return "\n\n".join(parts)

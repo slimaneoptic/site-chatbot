@@ -4,3 +4,4 @@ requests>=2.31
 trafilatura>=2.0
 lxml>=5.0
 rank_bm25>=0.2.2
+pypdf>=4.0

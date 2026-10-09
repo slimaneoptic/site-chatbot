@@ -24,7 +24,7 @@ from scraper import BlockedURL, Page, crawl  # noqa: E402
 from search import Index  # noqa: E402
 
 # ---- edit these two lines -------------------------------------------------
-AUTHOR = "Slimane"
+AUTHOR = "S'limane"
 HIRE_URL = "https://www.upwork.com/freelancers/~01d6ae0f1a06a43ac0"
 # ---------------------------------------------------------------------------
 

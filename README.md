@@ -1,6 +1,12 @@
 # Website chatbot & scraper
 
-**Live demo:** https://slimaneoptic-chatbot.streamlit.app
+Answers only from the content, with citations.
+
+**Live demo:** https://slimanechanchoul.com/chatbot/ · Streamlit app (may take a minute to wake): https://slimaneoptic-chatbot.streamlit.app
+
+Demo on sample data.
+
+Tests: `pytest -q tests`
 
 Paste a website or upload PDFs. It answers questions **only from that content** with sources, extracts the fields you name into a table, and gives you the clean text as CSV or JSON.
 

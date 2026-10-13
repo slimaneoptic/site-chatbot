@@ -1,0 +1,18 @@
+# Vercel (Hobby, free) hosting for the FastAPI backend in api/main.py.
+# Streamlit Cloud keeps using requirements.txt; this file is only read by Vercel.
+[project]
+name = "site-chatbot-api"
+version = "0.3.0"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "fastapi>=0.115",
+    "python-multipart>=0.0.9",
+    "requests>=2.31",
+    "trafilatura>=2.0",
+    "lxml>=5.0",
+    "rank_bm25>=0.2.2",
+    "pypdf>=4.0",
+]
+
+[tool.vercel]
+entrypoint = "api.main:app"

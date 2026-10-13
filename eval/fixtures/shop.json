@@ -1,0 +1,27 @@
+[
+ {
+  "url": "https://atlas-home.example/shipping",
+  "title": "Shipping and delivery",
+  "text": "We deliver everywhere in Morocco.\nOrders to Casablanca, Rabat and Marrakech arrive in 1 to 2 working days. Other cities take 2 to 4 working days.\nShipping costs 35 MAD per order and is free for orders over 500 MAD.\nWe also ship to France, Belgium and Spain in 5 to 8 working days for 120 MAD per order.\nOrders placed before 2 pm are packed the same day. You get a tracking link by SMS and email as soon as the parcel leaves our warehouse."
+ },
+ {
+  "url": "https://atlas-home.example/returns",
+  "title": "Returns and refunds",
+  "text": "You can return any unused item within 14 days of delivery for a full refund. Items must be in their original packaging.\nReturn shipping is free when the item is faulty or we sent the wrong item. Otherwise a 25 MAD return fee is deducted from your refund.\nRefunds go back to your original payment method within 5 working days after we receive the item.\nCushion inserts and opened candles can't be returned for hygiene reasons.\nTo start a return, message us on WhatsApp with your order number."
+ },
+ {
+  "url": "https://atlas-home.example/payment",
+  "title": "Payment methods",
+  "text": "We accept Visa and Mastercard bank cards, PayPal for orders from outside Morocco, and cash on delivery in Morocco for orders up to 3,000 MAD.\nCard payments are processed by CMI with 3-D Secure. We never store your card number.\nBusiness customers can pay by bank transfer for orders over 5,000 MAD; we send a proforma invoice first.\nPrices on the site include VAT (20%)."
+ },
+ {
+  "url": "https://atlas-home.example/contact",
+  "title": "Contact us",
+  "text": "Customer service is open Monday to Saturday, 9 am to 7 pm.\nWhatsApp: +212 600 000 111. Email: help@atlas-home.example.\nShowroom: 12 Rue Example, Maarif, Casablanca. Open Tuesday to Sunday, 10 am to 8 pm.\nWe answer WhatsApp messages within one hour during opening times."
+ },
+ {
+  "url": "https://atlas-home.example/about",
+  "title": "About Atlas Home",
+  "text": "Atlas Home is a Moroccan home decor shop founded in 2019 in Casablanca.\nWe sell handmade Berber rugs, Safi ceramics, brass lamps and cotton throws made by about 40 artisans in Morocco.\nEvery rug comes with a card naming the cooperative that wove it."
+ }
+]

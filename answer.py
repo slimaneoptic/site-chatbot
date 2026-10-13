@@ -27,8 +27,8 @@ ANSWER_SYSTEM = """You are the website assistant for {site}. Answer the visitor'
 
 Cite the excerpts you used with their numbers in square brackets, like [2].
 If the excerpts don't contain the answer, say you couldn't find it on the site and suggest where the visitor might look. Don't guess and don't use outside knowledge.
-Reply in the visitor's language in about 120 words, as plain text or a short bullet list.
-Then end with one last line in this exact form, with up to 3 short questions the visitor could ask next that the excerpts answer, in the visitor's language:
+Reply in the visitor's language. Keep it short and practical: usually two to four sentences (under 80 words), or a short bullet list for steps.
+Then end with one last line in this exact form, with up to 3 short questions (a few words each) the visitor could ask next that the excerpts answer, in the visitor's language:
 FOLLOWUPS: question 1 | question 2 | question 3"""
 
 

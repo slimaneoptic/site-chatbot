@@ -3,7 +3,7 @@
 `Index.top` is the old keyword search. `Index.search` adds what a chat needs: Arabic normalization,
 the previous question for follow-ups, a relevance cutoff (so an off-topic question finds nothing and
 costs no model call) and an optional query translation when the question and the site use different
-scripts. Pure functions of the index: no network, no `llm` import.
+scripts or languages. Pure functions of the index: no network, no `llm` import.
 """
 from __future__ import annotations
 
@@ -60,7 +60,8 @@ _AR_MAP = str.maketrans({
 })
 _AR_PREFIXES = ("وال", "فال", "بال", "كال", "لل", "ال")  # longest first; "لل" is ل + ال
 _WORD = re.compile(r"\w+")
-_SENT = re.compile(r"(?<=[.!?؟。])\s+|\n+")
+_SENT = re.compile(r"(?<=[.!?؟。])\s+|\n\s*\n")  # sentence ends and blank lines; single newlines are often hard wraps
+_SENT_MAX = 400  # a "sentence" longer than this (a list without punctuation) is split on its lines instead
 
 
 def normalize_text(text: str) -> str:
@@ -130,23 +131,54 @@ def _content(tokens: list[str]) -> list[str]:
     return list(seen)
 
 
-_EN_MARK = {"the", "and", "is", "are", "you", "your", "with", "for", "of", "to", "we", "our", "this", "that"}
-_FR_MARK = {"le", "la", "les", "des", "du", "et", "est", "vous", "votre", "nous", "avec", "pour", "dans", "une", "sur"}
+# Function words that mark a Latin-script language. Small closed sets, so a short question is enough
+# ("Quels moyens de paiement acceptez-vous ?" -> fr). Words shared by two languages are left out.
+_LATIN_MARKS = {
+    "en": set("the and is are you your with for of to we our this that what how do does can which when where "
+              "who why i my it there have has will would should".split()),
+    "fr": set("le la les des du et est vous votre vos nous avec pour dans une sur quel quels quelle quelles "
+              "comment combien pourquoi quand qui je peux puis-je sont ai avez acceptez".split()),
+    "es": set("el los las del y es usted ustedes con para una por qué cómo cuánto cuándo dónde puedo hay "
+              "tienen aceptan son".split()),
+    "de": set("der die das und ist sie ich wir mit für ein eine wie was wann wo warum kann können gibt "
+              "nicht auf ihr ihre".split()),
+    "it": set("il gli della di che è come quanto quando dove posso sono avete con per una".split()),
+    "pt": set("o os as da do dos das e é você vocês com para uma como quanto quando onde posso são aceitam "
+              "não".split()),
+}
+
+
+def _latin_lang(text: str, limit: int = 400) -> str:
+    """Best guess of a Latin-script text's language from function words; "" when nothing marks it."""
+    words = re.findall(r"[a-zà-öø-ÿ]+(?:-[a-zà-öø-ÿ]+)?", (text or "").lower())[:limit]
+    words += [h for w in words if "-" in w for h in w.split("-")]  # "acceptez-vous" -> acceptez, vous
+    if not words:
+        return ""
+    score = {lang: sum(w in marks for w in words) for lang, marks in _LATIN_MARKS.items()}
+    best = max(score, key=score.get)
+    if score[best] == 0 or sorted(score.values())[-2] == score[best]:
+        return ""  # unmarked or a tie: not sure, so no translation
+    return best
+
+
+def question_lang(text: str) -> str:
+    """"ar", or a Latin language code ("en", "fr", "es", ...), or "" when a Latin question has no clear marks."""
+    return "ar" if detect_lang(text) == "ar" else _latin_lang(text, 60)
 
 
 def _site_lang(passages: list[Passage]) -> tuple[str, str]:
-    """(script, language): ("ar", "ar") or ("latin", "en" | "fr"). Majority over passages; empty -> latin/en."""
+    """(script, language): ("ar", "ar") or ("latin", "en" | "fr" | "es" | ...). Majority over passages; empty -> latin/en."""
     if not passages:
         return "latin", "en"
     ar = sum(detect_lang(p.text) == "ar" for p in passages)
     if ar * 2 > len(passages):
         return "ar", "ar"
-    en = fr = 0
+    votes: dict[str, int] = {}
     for p in passages[:50]:
-        words = re.findall(r"[a-zà-ÿ]+", p.text.lower())[:400]
-        en += sum(w in _EN_MARK for w in words)
-        fr += sum(w in _FR_MARK for w in words)
-    return "latin", ("fr" if fr > en else "en")
+        lang = _latin_lang(p.text)
+        if lang:
+            votes[lang] = votes.get(lang, 0) + 1
+    return "latin", (max(votes, key=votes.get) if votes else "en")
 
 
 # ---------- trimming ----------
@@ -161,6 +193,20 @@ def _cut(text: str, max_chars: int) -> str:
     return cut.rstrip(" …") + "…"
 
 
+def _sentences(text: str) -> list[str]:
+    """Sentences with hard-wrapped lines joined ("...exit with a zero exit\nstatus." is one sentence)."""
+    out = []
+    for piece in _SENT.split(text or ""):
+        piece = piece.strip()
+        if not piece:
+            continue
+        if len(piece) > _SENT_MAX and "\n" in piece:
+            out += [ln.strip() for ln in piece.split("\n") if ln.strip()]
+        else:
+            out.append(re.sub(r"\s*\n\s*", " ", piece))
+    return out
+
+
 def trim_passage(p: Passage, query: str, max_chars: int = 600, context: int = 1) -> Passage:
     """Keep the sentences holding the query's content words plus `context` sentences each side, joined with
     " … ", cut to max_chars on a word boundary. Same url/title. Returns p unchanged when nothing matches."""
@@ -168,7 +214,7 @@ def trim_passage(p: Passage, query: str, max_chars: int = 600, context: int = 1)
     words = set(_content(q)) or set(q)
     if not words:
         return p
-    sents = [s.strip() for s in _SENT.split(p.text) if s and s.strip()]
+    sents = _sentences(p.text)
     found = [i for i, s in enumerate(sents) if words & set(_tokens(s))]
     if not found:
         return p
@@ -242,7 +288,7 @@ class Index:
         lang = detect_lang(question)
         res = self._search(question, k, prev_question, "")
         res.lang = lang
-        cross = translate is not None and self.bm25 is not None and lang != self.lang and any(c.isalpha() for c in question)
+        cross = translate is not None and self.bm25 is not None and any(c.isalpha() for c in question) and self._foreign(question)
         well_covered = bool(res.hits) and max(h.coverage for h in res.hits) >= TRANSLATE_SKIP_COVERAGE
         if not cross or well_covered:  # one model call, and only when the question's own words do not find it
             return res
@@ -255,6 +301,14 @@ class Index:
         res = self._search(question, k, prev_question, tr)
         res.lang, res.translated = lang, True
         return res
+
+    def _foreign(self, question: str) -> bool:
+        """Question in another language than the site: another script, or another Latin language
+        (a French question on an English site). An unmarked Latin question counts as the site's language."""
+        if detect_lang(question) != self.lang:
+            return True
+        q = question_lang(question)
+        return bool(q) and self.lang == "latin" and q != self.site_lang
 
     def _gain(self, q: list[str]) -> list[float]:
         if not q:

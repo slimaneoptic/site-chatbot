@@ -192,3 +192,51 @@ def test_trim_passage_unchanged_when_nothing_matches_and_works_in_arabic():
     assert trim_passage(p, "zzzz") is p
     ar = Passage("u", "t", "نوصل إلى جميع المدن. يمكنك إرجاع المنتج خلال 14 يوما. نحن متجر مغربي.")
     assert trim_passage(ar, "الإرجاع", context=0).text == "يمكنك إرجاع المنتج خلال 14 يوما."
+
+
+# ---------- cross-language within the Latin script (wave 2) ----------
+
+def test_question_lang_marks_latin_languages():
+    assert search.question_lang("Quels moyens de paiement acceptez-vous ?") == "fr"
+    assert search.question_lang("What payment methods do you accept?") == "en"
+    assert search.question_lang("¿Cuánto cuesta el envío a Casablanca?") == "es"
+    assert search.question_lang("كيف أرجع المنتج؟") == "ar"
+    assert search.question_lang("PayPal?") == ""  # nothing marks it: treated as the site's language
+
+
+def test_french_question_on_english_site_uses_translation():
+    q = "Quels moyens de paiement acceptez-vous ?"
+    assert Index(SHOP).search(q).matched is False  # no translator: no shared content word
+    tr = StubTranslate({q: "Which payment methods do you accept?"})
+    found = Index(SHOP).search(q, translate=tr)
+    assert tr.calls == [(q, "en")] and found.translated and found.lang == "latin"
+    assert found.passages[0].url.endswith("/payment")
+
+
+def test_english_question_on_french_site_translates_into_french():
+    fr = Index([Page("https://fr.example/livraison", "Livraison", "Nous livrons dans toute la France en 48 heures. Les frais de port sont offerts dès 50 euros."),
+                Page("https://fr.example/paiement", "Paiement", "Nous acceptons la carte bancaire et PayPal pour vous simplifier la vie.")])
+    q = "How long does shipping take?"
+    tr = StubTranslate({q: "Livraison en France : combien d'heures ?"})
+    found = fr.search(q, translate=tr)
+    assert tr.calls == [(q, "fr")] and found.translated
+    assert found.passages[0].url.endswith("/livraison")
+
+
+def test_latin_translation_skipped_when_covered_or_same_language_or_unmarked():
+    tr = StubTranslate({})
+    assert Index(SHOP).search("PayPal et Visa pour vous ?", translate=tr).matched  # French marks, but 100% covered
+    Index(SHOP).search("Can I pay with PayPal?", translate=tr)                    # same language
+    Index(SHOP).search("Who won the 2022 World Cup?", translate=tr)               # same language, off-topic: still 0 calls
+    Index(SHOP).search("Mastercard?", translate=tr)                               # unmarked
+    assert tr.calls == []
+
+
+def test_trim_joins_hard_wrapped_lines():
+    p = Passage("https://docs.example/interp", "Interpreter",
+                "See the install manager for other ways to launch it.\nTyping an end-of-file character (Control-D on Unix, Control-Z on\n"
+                "Windows) at the primary prompt causes the interpreter to exit with a zero exit\nstatus.  If that doesn't work, you can exit "
+                "the interpreter by typing the\nfollowing command: quit().\nThe interpreter's line-editing features include history.\n"
+                + "Unrelated filler sentence about colours and shapes. " * 12)
+    t = trim_passage(p, "How do I exit the interpreter?").text
+    assert "Control-D" in t and "quit()" in t and t.count("filler") <= 1  # one context sentence at most

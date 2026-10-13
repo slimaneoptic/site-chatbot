@@ -221,7 +221,8 @@ def stream_text(messages: list[dict], timeout: int = 90, *, max_tokens: int = 40
     raise _failure(errors)
 
 
-_LANG_NAMES = {"ar": "Arabic", "latin": "English", "en": "English", "fr": "French"}
+_LANG_NAMES = {"ar": "Arabic", "latin": "English", "en": "English", "fr": "French", "es": "Spanish", "de": "German",
+               "it": "Italian", "pt": "Portuguese"}
 
 
 def translate_query(text: str, target_lang: str, *, on_usage: Callable[[Usage], None] | None = None, timeout: int = 10) -> str:

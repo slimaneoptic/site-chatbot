@@ -229,13 +229,26 @@ def evaluate(code_dir: Path, mode: str, rows: list[dict], fixtures_dir: Path = H
             indexes[row["fixture"]] = (mods["search"].Index(pages), urlparse(pages[0].url).netloc)
         index, site = indexes[row["fixture"]]
         t0 = time.perf_counter()
+        n_tr = len(translate_usage)
         found, passages, matched = retrieve(index, row, translate)
+        tr_used = translate_usage[n_tr:]
         item = {"id": row["id"], "fixture": row["fixture"], "group": group(row), "lang": row["lang"], "answerable": row["answerable"],
                 "retrieval_ms": round((time.perf_counter() - t0) * 1000, 2), "passages": len(passages), "matched": matched,
                 "hit4": bool(set(row["expect_urls"]) & {p.url for p in passages[:4]}) if row["answerable"] else None,
                 "no_match_ok": (not matched) if not row["answerable"] else None}
         if mode == "full":
             item.update(answer_item(mods, site, row, found, passages, spy, stream))
+            # The visitor waits for the search too (a translation call there), and that call is billed.
+            wait = item["retrieval_ms"] / 1000
+            if item["ttft_s"] is not None:
+                item["ttft_s"] = round(item["ttft_s"] + wait, 3)
+            item["total_s"] = round(item["total_s"] + wait, 3)
+            item["translate_calls"] = len(tr_used)
+            if tr_used:
+                item["calls"] += len(tr_used)
+                item["input_tokens"] += sum(u.prompt_tokens for u in tr_used)
+                item["output_tokens"] += sum(u.completion_tokens for u in tr_used)
+                item["cost_usd"] = round(item["cost_usd"] + sum(u.cost_usd for u in tr_used), 6)
         items.append(item)
     return {"mode": mode, "code_dir": str(Path(code_dir).resolve()), "rev": git_rev(Path(code_dir)), "date": time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime()),
             "api_search": hasattr(mods["search"].Index, "search"), "api_ask": hasattr(mods["answer"], "ask"),
@@ -264,6 +277,7 @@ def summarize(items: list[dict], mode: str) -> dict:
             "false_refusals": sum(1 for i in ans if i["refused"]),
             "correct_by_group": {g: _pct(sum(i["correct"] for i in items if i["group"] == g), sum(1 for i in items if i["group"] == g)) for g in ("single", "followup", "multilingual")},
             "model_calls": sum(i["calls"] for i in items),
+            "translate_calls": sum(i.get("translate_calls", 0) for i in items),
             "model_calls_on_unanswerable": sum(i["calls"] for i in unans),
             "input_tokens": sum(i["input_tokens"] for i in items),
             "output_tokens": sum(i["output_tokens"] for i in items),

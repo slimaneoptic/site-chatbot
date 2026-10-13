@@ -240,3 +240,48 @@ def test_trim_joins_hard_wrapped_lines():
                 + "Unrelated filler sentence about colours and shapes. " * 12)
     t = trim_passage(p, "How do I exit the interpreter?").text
     assert "Control-D" in t and "quit()" in t and t.count("filler") <= 1  # one context sentence at most
+
+
+# ---------------------------------------------------------------- wave 3: false "not on this site"
+
+def _fixture(name):
+    import json
+    path = Path(__file__).resolve().parents[1] / "eval" / "fixtures" / f"{name}.json"
+    return Index([Page(p["url"], p["title"], p["text"]) for p in json.loads(path.read_text(encoding="utf-8"))])
+
+
+def test_how_long_question_finds_the_refund_sentence():
+    r = _fixture("shop").search("How long do refunds take?")
+    assert r.matched and r.hits[0].passage.url.endswith("/returns")
+
+
+def test_long_multi_part_question_finds_every_part():
+    r = _fixture("shop").search("Explain every payment method, delivery rule and return condition in detail, as a long list.")
+    urls = {h.passage.url.rsplit("/", 1)[-1] for h in r.hits}
+    assert {"payment", "returns", "shipping"} <= urls
+
+
+@pytest.mark.parametrize("q", ["كم سعر التوصيل وكم يوما يستغرق؟", "كم تكلفة التوصيل وكم يوما يستغرق؟"])
+def test_arabic_two_part_question_finds_the_shipping_page(q):
+    r = _fixture("shop_ar").search(q)
+    assert r.matched and r.hits[0].passage.url.endswith("/shipping")
+
+
+def test_waw_plus_stopword_is_a_stopword_and_unit_plurals_meet():
+    assert search._content(search._tokens("وكم وهل")) == []
+    assert search._tokens("يوما") == search._tokens("أيام") == search._tokens("الأيام")
+    assert search._tokens("الواتساب") == search._tokens("واتساب")
+    assert search._tokens("tracking") == search._tokens("track") and search._tokens("shipping") == ["ship"]
+    assert search._tokens("string thing calling missing") == ["string", "thing", "call", "miss"]
+
+
+def test_off_site_multi_part_question_still_finds_nothing():
+    r = _fixture("shop").search("Who won the 2022 World Cup and who scored the final goal?")
+    assert not r.matched
+
+
+def test_parts_only_add_after_the_whole_question_hits():
+    r = _fixture("shop").search("How much is the return fee?")
+    assert [h.passage.url.rsplit("/", 1)[-1] for h in r.hits] == ["returns"]
+    assert search.split_parts("How much is the return fee?") == []
+    assert len(search.split_parts("كم سعر التوصيل وكم يوما يستغرق؟")) == 2

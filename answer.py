@@ -222,8 +222,13 @@ class AnswerRun:
                 return
         query = getattr(found, "search_query", "") or question
         passages = [self._trim(p, query) for p in list(found.passages)[:MAX_PASSAGES]]
+        self._reserved = False
         if self._budget is not None:
-            decision = self._budget.check(self._session, self._ip)
+            try:  # hold one unit until _done settles it (parallel requests can't all pass the caps)
+                decision = self._budget.check(self._session, self._ip, reserve=True)
+                self._reserved = decision.allowed
+            except TypeError:  # a budget without reservations
+                decision = self._budget.check(self._session, self._ip)
             if not decision.allowed:
                 text = extractive_answer(passages)
                 yield from self._finish(AnswerResult(text, "extractive", passages, parse_citations(text, len(passages)), [],
@@ -258,6 +263,7 @@ class AnswerRun:
             self._done(split_followups(full), passages, usages[-1] if usages else _estimate(messages, full), False, False, question)
             raise
         if failed and not full:
+            self._settle(usages[-1] if usages else llm.Usage())  # nothing streamed: free the reserved unit
             text = extractive_answer(passages)
             yield from self._finish(AnswerResult(text, "error", passages, parse_citations(text, len(passages)), [],
                                                  llm.Usage(), "AI busy"))
@@ -277,10 +283,18 @@ class AnswerRun:
         text, followups = parts
         self.result = AnswerResult(text, "error" if failed else "answered", passages, parse_citations(text, len(passages)),
                                    followups, usage, "AI busy" if failed else "")
-        if self._budget is not None:
-            self._budget.record(self._session, self._ip, usage)
+        self._settle(usage)
         if use_cache and not failed and text and INTERRUPTED_NOTE not in text:
             self._cache.put(self._source, question, self.result)
+
+    def _settle(self, usage: llm.Usage) -> None:
+        if self._budget is None:
+            return
+        if getattr(self, "_reserved", False):
+            self._reserved = False
+            self._budget.record(self._session, self._ip, usage, reserved=True)
+        else:
+            self._budget.record(self._session, self._ip, usage)
 
 
 def ask(site: str, question: str, found, history: list[dict], *, source: str, session: str, ip: str,

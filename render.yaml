@@ -20,5 +20,7 @@ services:
         sync: false
       - key: IP_CRAWL_CAP
         sync: false
+      - key: IP_UPLOAD_CAP
+        sync: false
       - key: PYTHON_VERSION
         sync: false

@@ -1,7 +1,10 @@
 """Polite same-site crawler: robots.txt, rate limit, size and time caps, no internal addresses.
 
 Every failure a visitor can cause comes out as a CrawlError with a short, friendly message.
-Known gap (wave 1, note only): DNS can change between check_public_url() and the real request (DNS rebinding).
+DNS rebinding: check_public_url() resolves the host, but the HTTP library resolves it again when it connects,
+so a host could answer "public" first and "private" next. Every session used here therefore gets
+PublicOnlyAdapter: right after each TCP connect (every hop, every redirect, before TLS or any byte is sent)
+the address actually connected to is checked with _public_ip(), and a private one raises BlockedURL.
 """
 from __future__ import annotations
 
@@ -20,6 +23,10 @@ from urllib.parse import urldefrag, urljoin, urlparse, urlunparse
 import lxml.html
 import requests
 import trafilatura
+from requests.adapters import HTTPAdapter
+from requests.sessions import Session as _Session  # the class itself, even if a test swaps requests.Session
+from urllib3.connection import HTTPConnection, HTTPSConnection
+from urllib3.connectionpool import HTTPConnectionPool, HTTPSConnectionPool
 
 USER_AGENT = "SiteChatbotDemo/1.0 (portfolio demo; polite crawler)"
 MAX_BYTES = 2_000_000
@@ -125,6 +132,7 @@ def normalize_url(url: str) -> str:
 
 
 _NAT64 = ipaddress.ip_network("64:ff9b::/96")
+_V4_COMPAT = ipaddress.ip_network("::/96")  # deprecated IPv4-compatible form ::a.b.c.d
 
 
 def _public_ip(raw: str) -> bool:
@@ -134,11 +142,11 @@ def _public_ip(raw: str) -> bool:
         return False
     if ip.version == 6:  # IPv6 forms that carry an IPv4 address inside
         inner = ip.ipv4_mapped or ip.sixtofour or (ip.teredo[1] if ip.teredo else None)
-        if inner is None and ip in _NAT64:
+        if inner is None and (ip in _NAT64 or ip in _V4_COMPAT):
             inner = ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
         if inner is not None and not _public_ip(str(inner)):
             return False
-    return ip.is_global and not ip.is_multicast
+    return ip.is_global and not ip.is_multicast and not ip.is_reserved
 
 
 def check_public_url(url: str) -> None:
@@ -164,10 +172,67 @@ def check_public_url(url: str) -> None:
             raise BlockedURL("blocked", "That address points to a private or internal network.")
 
 
+def _check_peer(sock) -> None:
+    """Raise BlockedURL (and close the socket) unless the socket is connected to a public address."""
+    try:
+        peer = str(sock.getpeername()[0])
+    except (OSError, IndexError, TypeError, AttributeError):
+        peer = ""
+    if not _public_ip(peer):
+        try:
+            sock.close()
+        except OSError:
+            pass
+        raise BlockedURL("blocked", "That address points to a private or internal network.")
+
+
+class _PublicOnlyHTTPConnection(HTTPConnection):
+    def _new_conn(self):
+        sock = super()._new_conn()
+        _check_peer(sock)
+        return sock
+
+
+class _PublicOnlyHTTPSConnection(HTTPSConnection):
+    def _new_conn(self):  # runs before the TLS handshake
+        sock = super()._new_conn()
+        _check_peer(sock)
+        return sock
+
+
+class _PublicOnlyHTTPPool(HTTPConnectionPool):
+    ConnectionCls = _PublicOnlyHTTPConnection
+
+
+class _PublicOnlyHTTPSPool(HTTPSConnectionPool):
+    ConnectionCls = _PublicOnlyHTTPSConnection
+
+
+class PublicOnlyAdapter(HTTPAdapter):
+    """requests adapter whose connections check the connected peer address (closes the DNS rebinding gap)."""
+
+    def init_poolmanager(self, *args, **kwargs):
+        super().init_poolmanager(*args, **kwargs)
+        self.poolmanager.pool_classes_by_scheme = {"http": _PublicOnlyHTTPPool, "https": _PublicOnlyHTTPSPool}
+
+    def proxy_manager_for(self, proxy, **proxy_kwargs):  # a proxy would hide the real peer: never use one
+        raise BlockedURL("unreachable", "The demo reader does not use proxies.")
+
+
+def _harden(session) -> None:
+    """Mount PublicOnlyAdapter on a real requests.Session (once) and ignore proxy env vars. Test fakes pass through."""
+    if isinstance(session, _Session) and not isinstance(session.get_adapter("https://x.invalid/"), PublicOnlyAdapter):
+        session.trust_env = False
+        session.proxies = {}
+        session.mount("http://", PublicOnlyAdapter())
+        session.mount("https://", PublicOnlyAdapter())
+
+
 def _download(session, url: str, *, max_redirects: int = 3, max_bytes: int | None = None, truncate: bool = False,
               deadline: float | None = None, allow: Callable[[str], bool] | None = None):
     """GET with every redirect hop re-checked. Returns (final_url, status, headers, body, encoding); raises CrawlError."""
     max_bytes = MAX_BYTES if max_bytes is None else max_bytes
+    _harden(session)
     stop_at = time.monotonic() + 3 * TIMEOUT_S
     if deadline is not None:
         stop_at = min(stop_at, deadline)
@@ -306,8 +371,20 @@ def _extract(html: str, url: str) -> tuple[str, str]:
     except Exception:  # noqa: BLE001 - a broken page must not stop the crawl
         log.warning("text extraction failed for %s", url, exc_info=True)
         return "", ""
-    text = (data.get("text") or "").replace("¶", "").strip()
+    text = strip_inline_html((data.get("text") or "").replace("¶", "")).strip()
     return (data.get("title") or "").strip(), text
+
+
+# Colour markup that docs keep as text inside terminal blocks (FastAPI: <font color="#4E9A06">fastapi</font>).
+# Only these presentational tags, with plain attributes: code such as `a < b` or `List<int>` is left alone.
+_INLINE_TAG = re.compile(
+    r"</?(?:font|span|u|b|i|em|strong|mark|small|kbd)(?:\s+[a-zA-Z-]+=(?:\"[^\"<>]*\"|'[^'<>]*'))*\s*/?>",
+    re.IGNORECASE)
+
+
+def strip_inline_html(text: str) -> str:
+    """Drop inline colour/format tags left in extracted text; the words inside them stay."""
+    return _INLINE_TAG.sub("", text or "")
 
 
 def _load_robots(session, scheme: str, host: str, deadline: float) -> robotparser.RobotFileParser:

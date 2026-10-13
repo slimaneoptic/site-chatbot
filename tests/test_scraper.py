@@ -1,4 +1,5 @@
 """Crawler tests: no network. A fake requests session serves HTML strings; DNS is faked too."""
+import io
 import ipaddress
 import socket
 import sys
@@ -346,3 +347,121 @@ def test_duplicate_pages_kept_once(site):
     site(routes)
     urls = [p.url for p in read_site("https://shop.test/help/").pages]
     assert urls.count("https://shop.test/help/") == 1
+
+
+# ---- DNS rebinding: the address actually connected to is checked (fake sockets, no network) -----------
+
+class FakeSock:
+    """Just enough of a socket for urllib3/http.client: records what was sent, answers with `reply`."""
+
+    def __init__(self, peer, reply=b""):
+        self.peer, self.reply, self.sent, self.closed = peer, reply, b"", False
+
+    def getpeername(self):
+        return (self.peer, 80)
+
+    def sendall(self, data):
+        self.sent += bytes(data)
+
+    def makefile(self, *a, **kw):
+        return io.BytesIO(self.reply)
+
+    def settimeout(self, t):
+        pass
+
+    def gettimeout(self):
+        return None
+
+    def setsockopt(self, *a):
+        pass
+
+    def close(self):
+        self.closed = True
+
+
+def http_reply(body=b"", status="200 OK", headers=()):
+    head = [f"HTTP/1.1 {status}", f"Content-Length: {len(body)}", "Connection: close", *headers]
+    return ("\r\n".join(head) + "\r\n\r\n").encode() + body
+
+
+@pytest.fixture
+def rebinding(monkeypatch):
+    """DNS check says public (fake_dns), but the connect lands on whatever `peers[host]` says."""
+    import urllib3.util.connection as u3conn
+    monkeypatch.setattr(socket, "getaddrinfo", fake_dns)
+    peers, socks = {}, []
+
+    def connect(address, *a, **kw):
+        peer, reply = peers[address[0]]
+        socks.append(FakeSock(peer, reply))
+        return socks[-1]
+    monkeypatch.setattr(u3conn, "create_connection", connect)
+    return peers, socks
+
+
+def test_rebinding_host_is_blocked_at_connect(rebinding):
+    peers, socks = rebinding
+    peers["rebind.test"] = ("127.0.0.1", http_reply(b"secret"))
+    with requests.Session() as sess, pytest.raises(BlockedURL) as err:
+        scraper._download(sess, "http://rebind.test/")
+    assert err.value.code == "blocked"
+    assert socks[0].sent == b"" and socks[0].closed  # not one byte went to the private address
+
+
+def test_public_peer_still_works_and_proxies_are_ignored(rebinding, monkeypatch):
+    peers, socks = rebinding
+    monkeypatch.setenv("HTTP_PROXY", "http://10.0.0.9:3128")
+    peers["shop.test"] = ("93.184.216.34", http_reply(b"<p>hi</p>", headers=["Content-Type: text/html"]))
+    with requests.Session() as sess:
+        final, status, headers, body, _ = scraper._download(sess, "http://shop.test/a")
+        assert isinstance(sess.get_adapter("https://shop.test/"), scraper.PublicOnlyAdapter)
+    assert (final, status, body) == ("http://shop.test/a", 200, b"<p>hi</p>")
+    assert socks[0].sent.startswith(b"GET /a HTTP/1.1")
+
+
+def test_redirect_hop_to_rebinding_host_is_blocked(rebinding):
+    peers, socks = rebinding
+    peers["shop.test"] = ("93.184.216.34", http_reply(status="302 Found", headers=["Location: http://other.test/x"]))
+    peers["other.test"] = ("10.0.0.5", http_reply(b"internal"))
+    with requests.Session() as sess, pytest.raises(BlockedURL):
+        scraper._download(sess, "http://shop.test/")
+    assert [s.peer for s in socks] == ["93.184.216.34", "10.0.0.5"] and socks[1].sent == b""
+
+
+@pytest.mark.parametrize("peer", ["169.254.169.254", "::ffff:127.0.0.1", "64:ff9b::a00:5", "::1", ""])
+def test_https_connection_checks_peer_before_tls(rebinding, peer):
+    peers, socks = rebinding
+    peers["rebind.test"] = (peer, b"")
+    conn = scraper._PublicOnlyHTTPSConnection("rebind.test", 443)
+    with pytest.raises(BlockedURL):
+        conn._new_conn()
+    assert socks[0].closed
+    pools = scraper.PublicOnlyAdapter().poolmanager.pool_classes_by_scheme
+    assert pools["https"].ConnectionCls is scraper._PublicOnlyHTTPSConnection
+    assert pools["http"].ConnectionCls is scraper._PublicOnlyHTTPConnection
+
+
+def test_read_site_start_page_on_rebinding_host_is_blocked(rebinding, monkeypatch):
+    peers, socks = rebinding
+    monkeypatch.setattr(scraper, "DELAY_S", 0)
+    peers["rebind.test"] = ("192.168.1.1", http_reply(b"router"))
+    with pytest.raises(BlockedURL):
+        read_site("http://rebind.test/")
+    assert all(s.sent == b"" for s in socks)
+
+
+@pytest.mark.parametrize("raw", ["::7f00:1", "::a00:1", "::c0a8:1", "::8.8.8.8", "100::1"])
+def test_ipv4_compatible_and_reserved_ipv6_are_not_public(raw):
+    assert scraper._public_ip(raw) is False
+
+
+def test_public_ipv6_still_public():
+    assert scraper._public_ip("2606:4700:4700::1111") is True and scraper._public_ip("8.8.8.8") is True
+
+
+def test_terminal_colour_markup_is_stripped_but_code_is_kept():
+    raw = ('$ <font color="#4E9A06">uv run fastapi</font> dev\n  <span style="background-color:#009485">'
+           '<font color="#D3D7CF"> FastAPI </font></span> <u style="text-decoration-style:solid"><b>main</b></u>')
+    assert scraper.strip_inline_html(raw) == "$ uv run fastapi dev\n   FastAPI  main"
+    code = "if a < b and c > d: x = List<int>() # <module> <stdin>"
+    assert scraper.strip_inline_html(code) == code

@@ -146,3 +146,24 @@ def test_same_question_from_another_visitor_comes_from_the_cache(app):
     other.chat_input[0].set_value("can I pay with paypal").run()
     assert not other.exception and len(app.model.calls) == 1  # no second model call
     assert other.session_state.chat[-1]["status"] == "cached"
+
+
+@pytest.mark.parametrize("forwarded, hops, peer, want", [
+    ("6.6.6.6, 203.0.113.7", None, "10.0.0.1", "203.0.113.7"),  # the visitor's fake first entry is ignored
+    ("6.6.6.6, 203.0.113.7, 10.1.1.1", "2", "10.0.0.1", "203.0.113.7"),
+    ("", None, "198.51.100.4", "198.51.100.4"),  # no proxy header: Streamlit's own TCP peer
+])
+def test_visitor_ip_uses_trusted_proxy_hop(app, monkeypatch, forwarded, hops, peer, want):
+    import budget
+    from streamlit.runtime.context import ContextProxy, StreamlitHeaders
+    monkeypatch.setattr(ContextProxy, "headers", property(lambda self: StreamlitHeaders(
+        [("X-Forwarded-For", forwarded)] if forwarded else [])))
+    monkeypatch.setattr(ContextProxy, "ip_address", property(lambda self: peer))
+    if hops:
+        monkeypatch.setenv("TRUSTED_PROXY_HOPS", hops)
+    else:
+        monkeypatch.delenv("TRUSTED_PROXY_HOPS", raising=False)
+    seen, real = [], budget.Budget.check_crawl
+    monkeypatch.setattr(budget.Budget, "check_crawl", lambda self, ip: seen.append(ip) or real(self, ip))
+    load(app)
+    assert not app.exception and seen == [want]

@@ -10,16 +10,16 @@ import pandas as pd
 import streamlit as st
 
 try:  # Streamlit Cloud secrets -> environment
-    for name in ("OPENROUTER_API_KEY", "OPENROUTER_MODELS", "DEMO_DAILY_USD"):
+    for name in ("OPENROUTER_API_KEY", "OPENROUTER_MODELS", "DEMO_DAILY_USD", "TRUSTED_PROXY_HOPS"):
         if name in st.secrets:
-            os.environ.setdefault(name, st.secrets[name])
+            os.environ.setdefault(name, str(st.secrets[name]))  # TOML ints (TRUSTED_PROXY_HOPS = 2) too
 except Exception:
     pass
 
 import llm  # noqa: E402
 import scraper  # noqa: E402
 from answer import NOT_FOUND_TEXT, ai_available, ask, extractive_answer  # noqa: E402
-from budget import Budget  # noqa: E402
+from budget import Budget, pick_client_ip  # noqa: E402
 from cache import AnswerCache, source_id  # noqa: E402
 from docs import read_pdfs  # noqa: E402
 from extract import extract_rows, parse_fields  # noqa: E402
@@ -62,11 +62,17 @@ SID = st.session_state.setdefault("sid", uuid.uuid4().hex)
 
 
 def visitor_ip() -> str:
-    """Client address for the daily caps. Behind a proxy the first X-Forwarded-For entry is the visitor
-    (a visitor can fake it, which only dodges the per-network cap; the session cap and USD budget still hold)."""
+    """Client address for the daily caps, with the same rule as api/main.py: the leftmost X-Forwarded-For entry
+    is whatever the visitor sent, so take the TRUSTED_PROXY_HOPS-th entry from the right (default 1 = the one
+    our hosting proxy wrote); with no header, Streamlit's own TCP peer (st.context.ip_address)."""
     try:
-        fwd = (st.context.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
-        return fwd or st.context.ip_address or "unknown"
+        hops = max(0, int(os.environ.get("TRUSTED_PROXY_HOPS") or 1))
+    except ValueError:
+        hops = 1
+    try:
+        headers = st.context.headers
+        forwarded = headers.get_all("X-Forwarded-For") if hasattr(headers, "get_all") else [headers.get("X-Forwarded-For") or ""]
+        return pick_client_ip(forwarded, st.context.ip_address, hops)
     except Exception:  # noqa: BLE001 - bare mode / tests
         return "unknown"
 

@@ -1,5 +1,6 @@
-"""Daily guards for the public demo: AI answers per session and per IP, a global USD budget
-and site reads per IP. One shared instance per process; counters reset at 00:00 UTC."""
+"""Daily guards for the public demo: AI answers per session and per IP, a global USD budget,
+site reads per IP and PDF uploads per IP. One shared instance per process; counters reset at 00:00 UTC.
+Also pick_client_ip(): the visitor address for the per-IP caps, shared by api/main.py and app.py."""
 from __future__ import annotations
 
 import threading
@@ -12,17 +13,36 @@ MESSAGES = {
     "ip_cap": "Today's AI answers for your network are used up, so here are the most relevant passages from the site instead. AI answers come back tomorrow.",
     "global_budget": "The demo has used today's AI budget, so here are the most relevant passages from the site instead. AI answers come back tomorrow.",
     "ip_crawl_cap": "You have read the maximum number of sites for today. You can still ask about the sites already loaded, or come back tomorrow.",
+    "ip_upload_cap": "You have uploaded the maximum number of PDFs for today. You can still ask about the files already loaded, or come back tomorrow.",
 }
+
+
+def pick_client_ip(forwarded, peer: str | None, hops: int = 1, platform_ip: str | None = None) -> str:
+    """Visitor address for the daily caps. `forwarded` is the X-Forwarded-For header (a string or the list of
+    its values). Its leftmost entry is whatever the visitor sent, so trusting it would let anyone dodge the
+    per-IP caps. Take instead the entry our own proxy wrote: the `hops`-th from the right (1 = the address the
+    platform's proxy saw). `platform_ip` (a header the platform sets and overwrites) wins when present.
+    hops=0 or no header: the TCP peer."""
+    if platform_ip and platform_ip.strip():
+        return platform_ip.strip()[:64]
+    if isinstance(forwarded, str):
+        forwarded = [forwarded]
+    entries = [e.strip() for e in ",".join(v for v in (forwarded or []) if v).split(",") if e.strip()]
+    if entries and hops > 0:
+        return entries[-min(hops, len(entries))][:64]
+    return (peer or "unknown")[:64]
 
 
 @dataclass
 class BudgetDecision:
     allowed: bool
-    reason: str  # "ok" | "session_cap" | "ip_cap" | "global_budget" | "ip_crawl_cap"
+    reason: str  # "ok" | "session_cap" | "ip_cap" | "global_budget" | "ip_crawl_cap" | "ip_upload_cap"
     message: str  # friendly visitor text, "" when ok
 
 
 OK = BudgetDecision(True, "ok", "")
+RESERVE_USD = 0.002   # what one in-flight answer may still cost (an answer costs ~$0.0004-0.001)
+RESERVE_TTL_S = 300   # a reservation nobody settled (a crash between check and record) frees itself
 
 
 def _deny(reason: str) -> BudgetDecision:
@@ -31,11 +51,12 @@ def _deny(reason: str) -> BudgetDecision:
 
 class Budget:
     def __init__(self, session_cap: int = 12, ip_cap: int = 30, daily_usd: float = 1.0,
-                 ip_crawl_cap: int = 5, clock=time.time):
+                 ip_crawl_cap: int = 5, clock=time.time, ip_upload_cap: int = 10):
         self.session_cap = session_cap
         self.ip_cap = ip_cap
         self.daily_usd = daily_usd
         self.ip_crawl_cap = ip_crawl_cap
+        self.ip_upload_cap = ip_upload_cap
         self._clock = clock
         self._lock = threading.Lock()
         self._day = ""
@@ -54,22 +75,38 @@ class Budget:
             self._by_session: dict[str, int] = {}
             self._by_ip: dict[str, int] = {}
             self._crawls_by_ip: dict[str, int] = {}
+            self._uploads = 0
+            self._uploads_by_ip: dict[str, int] = {}
+            self._pending: list[tuple[float, str, str]] = []  # (time, session, ip) of answers in flight
 
-    def check(self, session: str, ip: str) -> BudgetDecision:
+    def check(self, session: str, ip: str, reserve: bool = False) -> BudgetDecision:
+        """May this session/IP get an AI answer now? reserve=True (the caller will call the model) holds one unit
+        until record(..., reserved=True) settles it, so a burst of parallel requests can't all pass the caps
+        before the first one is counted."""
         with self._lock:
             self._reset_if_new_day()
-            if self._spent >= self.daily_usd:
+            now = self._clock()
+            self._pending = [r for r in self._pending if now - r[0] < RESERVE_TTL_S]
+            if self._spent + RESERVE_USD * len(self._pending) >= self.daily_usd:
                 return _deny("global_budget")
-            if self._by_session.get(session, 0) >= self.session_cap:
+            if self._by_session.get(session, 0) + sum(r[1] == session for r in self._pending) >= self.session_cap:
                 return _deny("session_cap")
-            if self._by_ip.get(ip, 0) >= self.ip_cap:
+            if self._by_ip.get(ip, 0) + sum(r[2] == ip for r in self._pending) >= self.ip_cap:
                 return _deny("ip_cap")
+            if reserve:
+                self._pending.append((now, session, ip))
             return OK
 
-    def record(self, session: str, ip: str, usage) -> None:
-        """Count one question when usage.calls > 0; always add its cost."""
+    def record(self, session: str, ip: str, usage, reserved: bool = False) -> None:
+        """Count one question when usage.calls > 0; always add its cost. reserved=True also frees the unit
+        that check(..., reserve=True) held."""
         with self._lock:
             self._reset_if_new_day()
+            if reserved:
+                for i, r in enumerate(self._pending):
+                    if r[1] == session and r[2] == ip:
+                        del self._pending[i]
+                        break
             self._spent += max(0.0, float(getattr(usage, "cost_usd", 0.0) or 0.0))
             if getattr(usage, "calls", 0) > 0:
                 self._questions += 1
@@ -89,7 +126,21 @@ class Budget:
             self._crawls += 1
             self._crawls_by_ip[ip] = self._crawls_by_ip.get(ip, 0) + 1
 
+    def check_upload(self, ip: str) -> BudgetDecision:
+        with self._lock:
+            self._reset_if_new_day()
+            if self._uploads_by_ip.get(ip, 0) >= self.ip_upload_cap:
+                return _deny("ip_upload_cap")
+            return OK
+
+    def record_upload(self, ip: str) -> None:
+        with self._lock:
+            self._reset_if_new_day()
+            self._uploads += 1
+            self._uploads_by_ip[ip] = self._uploads_by_ip.get(ip, 0) + 1
+
     def snapshot(self) -> dict:
         with self._lock:
             self._reset_if_new_day()
-            return {"day": self._day, "spent_usd": round(self._spent, 6), "questions": self._questions, "crawls": self._crawls}
+            return {"day": self._day, "spent_usd": round(self._spent, 6), "questions": self._questions, "crawls": self._crawls,
+                    "uploads": self._uploads, "in_flight": len(self._pending)}

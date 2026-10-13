@@ -23,6 +23,8 @@ MIN_COVERAGE = 0.34      # tune with the eval; share of question content words f
 REL_CUTOFF = 0.5         # keep hits scoring >= REL_CUTOFF * best score
 PREV_WEIGHT = 0.5        # weight of the previous question's words in a follow-up search
 TRANSLATE_SKIP_COVERAGE = 0.6  # cross-language question already well covered as is -> no translation call
+SPLIT_BELOW_COVERAGE = 0.6  # a multi-part question whose best hit covers less is also searched part by part
+PART_MIN_COVERAGE = 0.25   # clause cutoff once the whole question found the site (it is on topic)
 
 Translate = Callable[[str, str], str]  # (question, target_lang) -> translated question; never raises
 
@@ -87,19 +89,37 @@ def detect_lang(text: str) -> str:
     return "ar" if ar > other else "latin"
 
 
+# Common Arabic unit words whose plural or case ending is not a prefix (broken plurals, tanween alif):
+# "كم يوما" must find "4 أيام", "بكم درهم" must find "30 درهما". Keys are normalized and prefix-stripped.
+_AR_FORMS = {
+    "ايام": "يوم", "يوما": "يوم", "اياما": "يوم", "ساعات": "ساعه", "اسابيع": "اسبوع", "اسبوعا": "اسبوع",
+    "شهور": "شهر", "اشهر": "شهر", "شهرا": "شهر", "دراهم": "درهم", "درهما": "درهم", "دقايق": "دقيقه",
+    "دقائق": "دقيقه", "سنوات": "سنه", "طلبات": "طلب", "منتجات": "منتج",
+}
+
+
 def _stem(t: str) -> str:
-    """Light, symmetric stemming: Arabic article prefixes on 4+ letter tokens, Latin plural -s/-ies."""
+    """Light, symmetric stemming: Arabic article prefixes on 4+ letter tokens and a few unit plurals, Latin
+    plural -s/-ies. A bare conjunction و is not stripped ("الواتساب" -> "واتساب" must still equal "واتساب");
+    و + a stopword ("وكم") is a stopword, see _is_stop."""
     n = len(t)
     if n < 4:
         return t
-    for pre in _AR_PREFIXES:
-        if t.startswith(pre):
-            return t[len(pre):] if n - len(pre) >= 2 else t
+    if not t.isascii():
+        for pre in _AR_PREFIXES:
+            if t.startswith(pre) and n - len(pre) >= 2:
+                t = t[len(pre):]
+                break
+        return _AR_FORMS.get(t, t)
     if t.isascii():
         if t.endswith("ies") and n > 4:
             return t[:-3] + "y"
         if t.endswith("s") and not t.endswith(("ss", "us", "is")):
-            return t[:-1]
+            t, n = t[:-1], n - 1
+        if t.endswith("ing") and n >= 7:  # "Can I track it?" finds "tracking"; "string", "thing", "during" stay
+            t = t[:-3]
+            if t[-1] == t[-2] and t[-1] not in "lsz":  # shipping -> ship, setting -> set; calling, missing keep
+                t = t[:-1]
     return t
 
 
@@ -118,15 +138,21 @@ mon ma mes ton ta tes son sa ses notre nos votre vos leur leurs que qui quoi que
 combien pourquoi ou dans sur pour par avec sans en au aux y ne pas plus se s qu c est-ce peut puis faire fait
 ما ماذا هل كيف كم متي اين من في علي الي عن مع هذا هذه ذلك تلك هناك هو هي هم انا نحن انت انتم التي الذي الذين او
 ثم لا لم لن ان قد كل اي بعد قبل عند حتي يمكن يمكنني ممكن اريد لماذا لكم لي لك عندكم
+explain describe detail details detailed please everything long often soon take takes took taking
 """
 _STOPWORDS = {_stem(t) for t in _WORD.findall(normalize_text(_STOP_RAW))}
+
+
+def _is_stop(t: str) -> bool:
+    """Stopword, or و/ف + an Arabic stopword ("وكم", "فهل": the 3-letter forms are not prefix-stripped)."""
+    return t in _STOPWORDS or (len(t) > 1 and t[0] in "وف" and not t.isascii() and t[1:] in _STOPWORDS)
 
 
 def _content(tokens: list[str]) -> list[str]:
     """Tokens without stopwords, first occurrence order, no duplicates."""
     seen: dict[str, None] = {}
     for t in tokens:
-        if t not in _STOPWORDS:
+        if not _is_stop(t):
             seen.setdefault(t)
     return list(seen)
 
@@ -179,6 +205,21 @@ def _site_lang(passages: list[Passage]) -> tuple[str, str]:
         if lang:
             votes[lang] = votes.get(lang, 0) + 1
     return "latin", (max(votes, key=votes.get) if votes else "en")
+
+
+# Clause breaks of a multi-part question: ? ; , and "and"/"et"/"y"/"und", Arabic "،" and و glued to a
+# question word ("كم سعر التوصيل وكم يوما يستغرق؟" -> two parts).
+_PART_SPLIT = re.compile(
+    r"[?؟;!،,]+|\s+(?:and|et|y|und|e|also)\s+|"
+    r"\s+(?=و(?:كم|ما|ماذا|هل|كيف|متى|متي|اين|أين|لماذا|من|بكم)(?:\s|$))",
+    re.IGNORECASE)
+
+
+def split_parts(question: str) -> list[str]:
+    """The question's clauses that have a content word of their own; [] when it has fewer than two."""
+    parts = [x.strip() for x in _PART_SPLIT.split(question or "") if x and x.strip()]
+    parts = [x for x in parts if _content(_tokens(x))]
+    return parts if len(parts) >= 2 else []
 
 
 # ---------- trimming ----------
@@ -291,15 +332,37 @@ class Index:
         cross = translate is not None and self.bm25 is not None and any(c.isalpha() for c in question) and self._foreign(question)
         well_covered = bool(res.hits) and max(h.coverage for h in res.hits) >= TRANSLATE_SKIP_COVERAGE
         if not cross or well_covered:  # one model call, and only when the question's own words do not find it
-            return res
+            return self._with_parts(res, question, k)
         try:
             tr = (translate(question, self.site_lang) or "").strip()
         except Exception:  # noqa: BLE001 - translate should never raise; a failure just means no translation
             tr = ""
         if not tr or _tokens(tr) == _tokens(question):
-            return res
+            return self._with_parts(res, question, k)
         res = self._search(question, k, prev_question, tr)
         res.lang, res.translated = lang, True
+        return self._with_parts(res, tr, k, translated=True)
+
+    def _with_parts(self, res: SearchResult, text: str, k: int, translated: bool = False) -> SearchResult:
+        """Query expansion for multi-part and long questions ("the delivery price and how many days it takes"):
+        when the whole question finds nothing or covers it poorly, search each clause on its own and add the
+        best passages of every clause after the whole-question hits (no model call)."""
+        if res.hits and max(h.coverage for h in res.hits) >= SPLIT_BELOW_COVERAGE:
+            return res
+        parts = split_parts(text)
+        if not parts:
+            return res
+        cut = PART_MIN_COVERAGE if res.hits else MIN_COVERAGE  # an off-site question gets no looser bar
+        found = [(self._search("", k, None, x, cut) if translated else self._search(x, k, None, "", cut)).hits
+                 for x in parts]
+        seen = {normalize_text(h.passage.text) for h in res.hits}
+        for rank in range(k):
+            for hits in found:
+                if len(res.hits) >= k:
+                    return res
+                if rank < len(hits) and normalize_text(hits[rank].passage.text) not in seen:
+                    seen.add(normalize_text(hits[rank].passage.text))
+                    res.hits.append(hits[rank])
         return res
 
     def _foreign(self, question: str) -> bool:
@@ -316,7 +379,7 @@ class Index:
         floor = sum(self.bm25.idf.get(t) or 0.0 for t in q) * self.bm25.delta  # what a passage with none of q gets
         return [float(s) - floor for s in self.bm25.get_scores(q)]
 
-    def _search(self, question: str, k: int, prev: str | None, tr: str) -> SearchResult:
+    def _search(self, question: str, k: int, prev: str | None, tr: str, min_cov: float | None = None) -> SearchResult:
         query = " ".join(s.strip() for s in (question, prev or "", tr) if s and s.strip())
         out = SearchResult(question, query)
         if not self.bm25 or k <= 0:
@@ -343,7 +406,7 @@ class Index:
             return best
 
         cand = [(i, coverage(i)) for i in range(len(self.passages)) if self.vocab[i] & qset and gain[i] > 1e-9]
-        cand = [(i, c) for i, c in cand if c >= MIN_COVERAGE]
+        cand = [(i, c) for i, c in cand if c >= (MIN_COVERAGE if min_cov is None else min_cov)]
         if not cand:
             return out
         best = max(gain[i] for i, _ in cand)

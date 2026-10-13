@@ -293,3 +293,195 @@ def test_long_history_is_cut_before_search():
                                            {"role": "assistant", "content": "ok"}])
     assert ev[-1][0] == "done", ev
     assert len(seen["prev"]) <= main.MAX_HISTORY_CHARS
+
+
+def _fake_pdf_pages(monkeypatch, n=2):
+    calls = []
+
+    def read_pdfs(files):
+        calls.append([f.name for f in files])
+        return [scraper.Page(f"{files[0].name}#page={i}", f"Page {i}", "Refunds take five working days. " * 10)
+                for i in range(1, n + 1)], []
+    monkeypatch.setattr(main.docs, "read_pdfs", read_pdfs)
+    return calls
+
+
+def test_pdf_upload_cap_per_ip(monkeypatch):
+    monkeypatch.delenv("TRUSTED_PROXY_HOPS", raising=False)
+    monkeypatch.delenv("CLIENT_IP_HEADER", raising=False)
+    calls = _fake_pdf_pages(monkeypatch)
+    client, _, app = make(budget=Budget(ip_upload_cap=2))
+
+    def upload(fake_ip):  # the visitor changes the address they send; our proxy appends the real one
+        return client.post("/api/kb", headers={"X-Forwarded-For": f"{fake_ip}, 203.0.113.7"},
+                           files={"files": ("guide.pdf", b"%PDF-1.4 fake", "application/pdf")})
+
+    assert upload("1.1.1.1").status_code == 200 and upload("2.2.2.2").status_code == 200
+    r = upload("3.3.3.3")
+    assert r.status_code == 429 and r.json()["error"]["code"] == "ip_upload_cap"
+    assert "PDF" in r.json()["error"]["message"] and len(calls) == 2
+    assert app.state.budget.snapshot()["uploads"] == 2
+    r = client.post("/api/kb?stream=1", headers={"X-Forwarded-For": "203.0.113.7"},
+                    files={"files": ("guide.pdf", b"%PDF", "application/pdf")})
+    assert r.status_code == 429 and r.json()["error"]["code"] == "ip_upload_cap"
+    other = client.post("/api/kb", headers={"X-Forwarded-For": "198.51.100.9"},
+                        files={"files": ("guide.pdf", b"%PDF", "application/pdf")})
+    assert other.status_code == 200 and len(calls) == 3  # another network still can upload
+
+
+def test_ip_upload_cap_env(monkeypatch):
+    monkeypatch.setenv("IP_UPLOAD_CAP", "1")
+    _, _, app = make()
+    assert app.state.budget.ip_upload_cap == 1
+    monkeypatch.delenv("IP_UPLOAD_CAP")
+    _, _, app = make()
+    assert app.state.budget.ip_upload_cap == 10
+
+
+def test_page_list_in_kb_json_stream_done_pdf_and_examples(monkeypatch):
+    def crawl(url, max_pages=15, on_page=None, **kw):
+        pages = [scraper.Page(f"{url}p{i}", f"Title {i}", "word " * 50) for i in range(25)]
+        for i, p in enumerate(pages, 1):
+            if on_page:
+                on_page(i, p.url)
+        return scraper.CrawlReport(url, pages, 25, "done", False, [])
+
+    client, _, _ = make(crawl=crawl, budget=Budget(ip_crawl_cap=9))
+    js = client.post("/api/kb", json={"url": "c.example"}).json()
+    assert len(js["page_list"]) == 20 and js["pages"] == 25
+    assert js["page_list"][0] == {"title": "Title 0", "url": "https://c.example/p0"}
+    assert [p["title"] for p in js["page_list"]] == [f"Title {i}" for i in range(20)]  # crawl order
+    done = [d for e, d in events(client.post("/api/kb?stream=1", json={"url": "c.example"})) if e == "done"][0]
+    assert done["page_list"] == js["page_list"]
+    _fake_pdf_pages(monkeypatch, n=3)
+    pdf = client.post("/api/kb", files={"files": ("guide.pdf", b"%PDF", "application/pdf")}).json()
+    assert [p["url"] for p in pdf["page_list"]] == ["guide.pdf#page=1", "guide.pdf#page=2", "guide.pdf#page=3"]
+    for ex in client.get("/api/examples").json()["examples"]:
+        assert ex["page_list"] and set(ex["page_list"][0]) == {"title", "url"}
+
+
+def test_sources_hl_at_is_a_javascript_span_of_hl():
+    client, _, _ = make()
+    for kb, q in (("ex-shop", "How long does delivery to Casablanca take?"), ("ex-shop_ar", "كم تكلفة الشحن؟")):
+        sources = dict(ask(client, q, kb=kb, session=kb))["sources"]
+        assert sources
+        for s in sources:
+            if not s["hl"]:
+                assert s["hl_at"] is None
+                continue
+            a, b = s["hl_at"]
+            utf16 = s["passage"].encode("utf-16-le")
+            assert utf16[2 * a:2 * b].decode("utf-16-le") == s["hl"]
+
+
+def test_js_span_counts_utf16_units():
+    assert main._js_span("😀 ab", "ab") == [3, 5]  # the emoji is 2 JavaScript units
+    assert main._js_span("abc", "") is None and main._js_span("abc", "zz") is None
+
+
+def test_arabic_example_has_four_starters():
+    client, _, _ = make()
+    ar = next(e for e in client.get("/api/examples").json()["examples"] if e["kb_id"] == "ex-shop_ar")
+    assert len(ar["starters"]) == 4 and ar["lang"] == "ar"
+
+
+def test_export_examples_keeps_the_live_stream_shape():
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+    import export_examples as exp
+    client, fake, _ = make(budget=Budget(session_cap=99, ip_cap=99))
+    data, problems = exp.build(client, log=lambda *a: None)
+    assert not problems and fake.calls == sum(len(e["starters"]) for e in data["examples"])
+    shop = next(e for e in data["examples"] if e["kb_id"] == "ex-shop")
+    assert set(shop) == {"kb_id", "label", "kind", "url", "lang", "pages", "words", "page_list", "starters"}
+    a = shop["starters"][0]
+    live = dict(ask(make()[0], a["q"]))
+    assert set(a) == {"q", "meta", "sources", "notice", "text", "followups", "done"}
+    assert a["meta"] == live["meta"] and a["sources"] == live["sources"] and a["followups"] == live["followups"]
+    assert set(a["done"]) == set(live["done"]) and a["done"]["left_today"] is None and a["done"]["status"] == "answered"
+    assert a["text"].startswith("Delivery to Casablanca") and "FOLLOWUPS" not in a["text"]
+    with pytest.raises(RuntimeError):
+        exp.to_answer("q", [("error", {"code": "kb_expired", "message": "x"})])
+
+
+# ---------------------------------------------------------------- wave 3 fixes
+
+def test_done_hl_points_at_the_sentence_the_answer_used():
+    fake = FakeLLM("A return fee of 25 MAD is deducted from your refund [1].\nFOLLOWUPS: How long do refunds take?")
+    client, _, _ = make(stream=fake)
+    history = [{"role": "user", "content": "How many days do I have to return an item?"},
+               {"role": "assistant", "content": "You have 14 days from delivery [1]."}]
+    ev = dict(ask(client, "How much is the return fee?", history=history))
+    src = ev["sources"][0]
+    # the guess uses this question's words, not the earlier "return an item within 14 days" question
+    assert "25 MAD return fee" in src["hl"]
+    hl = ev["done"]["hl"]["1"]
+    assert hl["hl"] == "Otherwise a 25 MAD return fee is deducted from your refund."
+    a, b = hl["hl_at"]
+    assert src["passage"][a:b] == hl["hl"]  # ASCII text: JS indices equal Python indices
+    assert ev["followups"] == ["How long do refunds take?"]
+
+
+def test_cached_arabic_answer_highlights_its_own_sentence_at_once():
+    fake = FakeLLM("يستغرق التوصيل من 2 إلى 4 أيام عمل [1].")
+    client, _, _ = make(stream=fake)
+    q = "كم يستغرق التوصيل؟"
+    first = dict(ask(client, q, kb="ex-shop_ar"))
+    assert first["done"]["hl"]["1"]["hl"].startswith("نوصل الطلبات")
+    again = dict(ask(client, q, kb="ex-shop_ar", session="s2"))
+    assert again["done"]["cached"] is True and fake.calls == 1
+    assert again["sources"][0]["hl"].startswith("نوصل الطلبات")  # no wait for done on a cached answer
+    a, b = again["sources"][0]["hl_at"]
+    assert again["sources"][0]["passage"].encode("utf-16-le")[2 * a:2 * b].decode("utf-16-le") == again["sources"][0]["hl"]
+
+
+def test_followups_the_site_cannot_answer_are_dropped():
+    fake = FakeLLM("Delivery takes 1 to 2 days [1].\nFOLLOWUPS: Can I track it? | Who won the 2022 World Cup? | Is it free?")
+    client, _, _ = make(stream=fake)
+    ev = dict(ask(client, "How long does delivery to Casablanca take?"))
+    assert ev["followups"] == ["Can I track it?", "Is it free?"]
+
+
+def test_chunked_upload_over_the_limit_is_stopped_while_streaming(monkeypatch):
+    monkeypatch.setenv("MAX_UPLOAD_MB", "1")
+    client, _, _ = make()
+    boundary = "xyz"
+    head = (f"--{boundary}\r\nContent-Disposition: form-data; name=\"files\"; filename=\"a.pdf\"\r\n"
+            "Content-Type: application/pdf\r\n\r\n").encode()
+    sent = {"n": 0}
+
+    def body():  # a generator body: httpx sends it chunked, with no Content-Length
+        yield head
+        for _ in range(40):  # 40 x 64 KB = 2.6 MB
+            sent["n"] += 1
+            yield b"%" * 65_536
+        yield f"\r\n--{boundary}--\r\n".encode()
+
+    r = client.post("/api/kb", content=body(), headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+    assert r.status_code == 413 and r.json()["error"]["code"] == "too_big"
+    small = client.post("/api/kb", files={"files": ("a.pdf", b"%PDF-1.4 tiny", "application/pdf")})
+    assert small.status_code != 413
+
+
+def test_extract_cap_warning_does_not_promise_passages():
+    def complete(messages, schema, name="result"):
+        return {"rows": []}, "fake/model"
+
+    client, _, _ = make(complete=complete, budget=Budget(session_cap=0, ip_cap=30))
+    r = client.post("/api/extract", json={"kb_id": "ex-shop", "fields": "Method", "session_id": "x"}).json()
+    assert r["rows"] == [] and r["warnings"] and "passages" not in r["warnings"][0]
+    assert "extraction stopped" in r["warnings"][0]
+
+
+def test_export_folds_done_hl_into_sources():
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+    import export_examples as exp
+    ans = exp.to_answer("q", [("sources", [{"n": 1, "passage": "A. B.", "hl": "A.", "hl_at": [0, 2]}]),
+                              ("delta", {"text": "B [1]"}),
+                              ("done", {"status": "answered", "hl": {"1": {"hl": "B.", "hl_at": [3, 5]}}})])
+    assert ans["sources"][0]["hl"] == "B." and ans["sources"][0]["hl_at"] == [3, 5]
+
+
+def test_fastapi_example_has_no_terminal_markup():
+    client, fake, _ = make()
+    ev = dict(ask(client, "Which command starts the development server?", kb="ex-fastapi_tutorial"))
+    assert ev["sources"] and not any("<font" in s["passage"] or "<span" in s["passage"] for s in ev["sources"])

@@ -23,12 +23,13 @@ MAX_PASSAGES = 4
 NOT_FOUND_TEXT = "I couldn't find that on this site."  # fixed, 0 tokens
 INTERRUPTED_NOTE = "(The answer was interrupted. Please ask again.)"
 
-ANSWER_SYSTEM = """You are the website assistant for {site}. Answer the visitor's question using only the numbered excerpts from the site.
+ANSWER_SYSTEM = """You are the website assistant for {site}. Answer the visitor's question using only the numbered pages from the site below.
 
-Cite the excerpts you used with their numbers in square brackets, like [2].
-If the excerpts don't contain the answer, say you couldn't find it on the site and suggest where the visitor might look. Don't guess and don't use outside knowledge.
+Answer directly, as the site's own assistant. Never mention "excerpts", "passages" or "the provided text". When the visitor asks for a number of points, give exactly that many.
+Cite the pages you used with their numbers in square brackets, like [2].
+If the pages don't contain the answer, say you couldn't find it on the site and name the closest relevant page (by its title) where the visitor might look. Don't guess and don't use outside knowledge.
 Reply in the visitor's language. Keep it short and practical: usually two to four sentences (under 80 words), or a short bullet list for steps.
-Then end with one last line in this exact form, with up to 3 short questions (a few words each) the visitor could ask next that the excerpts answer, in the visitor's language:
+Then end with one last line in this exact form, with up to 3 short questions (a few words each) the visitor could ask next that these pages answer, in the visitor's language:
 FOLLOWUPS: question 1 | question 2 | question 3"""
 
 
@@ -176,7 +177,7 @@ def _build_messages(site: str, question: str, passages: list[Passage], history: 
     return (
         [{"role": "system", "content": ANSWER_SYSTEM.format(site=site)}]
         + trim_history(history)
-        + [{"role": "user", "content": f"Excerpts from the site:\n\n{_excerpts(passages)}\n\nQuestion: {question}"}]
+        + [{"role": "user", "content": f"Pages from the site:\n\n{_excerpts(passages)}\n\nQuestion: {question}"}]
     )
 
 
@@ -190,8 +191,10 @@ class AnswerRun:
     no_match / cached / extractive / error answers yield their whole text once."""
 
     def __init__(self, site: str, question: str, found, history: list[dict], *, source: str, session: str, ip: str,
-                 cache=None, budget=None, stream=llm.stream_text, trim: Callable[[Passage, str], Passage] | None = None):
+                 cache=None, budget=None, stream=llm.stream_text, trim: Callable[[Passage, str], Passage] | None = None,
+                 cache_any_turn: bool = False):
         self._args = (site, question, found, list(history or []))
+        self._cache_any_turn = cache_any_turn  # pinned examples: an exact cached question is served even mid-chat
         self._source, self._session, self._ip = source, session, ip
         self._cache, self._budget, self._stream = cache, budget, stream
         self._trim = trim or _default_trim
@@ -215,7 +218,7 @@ class AnswerRun:
             yield from self._finish(AnswerResult(NOT_FOUND_TEXT, "no_match", [], [], [], llm.Usage()))
             return
         use_cache = self._cache is not None and not history
-        if use_cache:
+        if use_cache or (self._cache is not None and self._cache_any_turn):
             hit = self._cache.get(self._source, question)
             if hit is not None:
                 yield from self._finish(replace(hit, status="cached", usage=llm.Usage(), note=""))
@@ -298,8 +301,8 @@ class AnswerRun:
 
 
 def ask(site: str, question: str, found, history: list[dict], *, source: str, session: str, ip: str,
-        cache=None, budget=None, stream=llm.stream_text, trim=None) -> AnswerRun:
+        cache=None, budget=None, stream=llm.stream_text, trim=None, cache_any_turn: bool = False) -> AnswerRun:
     """One answer, at most one model call. `found` is a search.SearchResult (duck typed:
     .matched, .passages, .search_query). Iterate the returned run, then read run.result."""
     return AnswerRun(site, question, found, history, source=source, session=session, ip=ip,
-                     cache=cache, budget=budget, stream=stream, trim=trim)
+                     cache=cache, budget=budget, stream=stream, trim=trim, cache_any_turn=cache_any_turn)

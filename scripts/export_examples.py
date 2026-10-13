@@ -47,6 +47,14 @@ from api import main  # noqa: E402
 from budget import Budget  # noqa: E402
 
 DEFAULT_OUT = ROOT.parents[2] / "site" / "chat" / "examples.json"
+STARTER_ANSWERS = ROOT / "api" / "starter_answers.json"  # the live API's warm cache (starters + follow-up chips)
+# Extract showcase per example: fields that suit the source, or None to hide the Extract card.
+EXTRACT_FIELDS = {
+    "ex-shop": ["fee or rule", "amount", "details"],
+    "ex-shop_ar": ["الرسوم أو القاعدة", "المبلغ", "التفاصيل"],
+    "ex-python_tutorial": None,   # long prose chapters: no honest table
+    "ex-fastapi_tutorial": None,
+}
 MAX_BYTES = 300_000
 SUMMARY_KEYS = ("kb_id", "label", "kind", "url", "lang", "pages", "words", "page_list")
 
@@ -85,23 +93,46 @@ def ask(client: TestClient, kb_id: str, question: str, session: str) -> dict:
     return to_answer(question, parse_sse(r.text))
 
 
-def build(client: TestClient, retries: int = 1, log=print) -> tuple[dict, list[str]]:
+def _answer(client: TestClient, kb_id: str, q: str, session: str, retries: int, log, problems: list[str]) -> dict:
+    for attempt in range(retries + 1):
+        ans = ask(client, kb_id, q, f"{session}-{attempt}")
+        if ans["done"]["status"] in ("answered", "cached"):
+            break
+    d = ans["done"]
+    d["left_today"] = None
+    log(f"  {kb_id:<22} {d['status']:<10} {d['ttfw_ms']:>6} ms  ${d['cost']:.5f}  {q[:60]}")
+    if d["status"] not in ("answered", "cached"):
+        problems.append(f"{kb_id}: {q!r} -> {d['status']}")
+    return ans
+
+
+def build(client: TestClient, retries: int = 1, log=print, followups: bool = True,
+          extract: bool = True) -> tuple[dict, list[str]]:
     problems: list[str] = []
     examples = []
     for ex in client.get("/api/examples").json()["examples"]:
         item = {k: ex.get(k) for k in SUMMARY_KEYS}
         item["starters"] = []
         for i, s in enumerate(ex["starters"]):
-            for attempt in range(retries + 1):
-                ans = ask(client, ex["kb_id"], s["q"], f"export-{ex['kb_id']}-{i}-{attempt}")
-                if ans["done"]["status"] == "answered":
-                    break
-            d = ans["done"]
-            d["left_today"] = None
-            log(f"  {ex['kb_id']:<22} {d['status']:<10} {d['ttfw_ms']:>6} ms  ${d['cost']:.5f}  {s['q'][:60]}")
-            if d["status"] != "answered":
-                problems.append(f"{ex['kb_id']}: {s['q']!r} -> {d['status']}")
-            item["starters"].append(ans)
+            item["starters"].append(_answer(client, ex["kb_id"], s["q"], f"export-{ex['kb_id']}-{i}", retries, log, problems))
+        if followups:  # each starter's chips, answered as first-turn questions (the natural second click)
+            item["followup_answers"] = {}
+            starters = {a["q"] for a in item["starters"]}
+            for a in item["starters"]:
+                for j, q in enumerate(a.get("followups") or []):
+                    if q in starters or q in item["followup_answers"]:
+                        continue
+                    item["followup_answers"][q] = _answer(client, ex["kb_id"], q, f"export-fu-{ex['kb_id']}-{j}",
+                                                          retries, log, problems)
+        if extract:
+            fields = EXTRACT_FIELDS.get(ex["kb_id"])
+            item["extract"] = None
+            if fields:
+                r = client.post("/api/extract", json={"kb_id": ex["kb_id"], "fields": fields,
+                                                      "session_id": f"export-x-{ex['kb_id']}"}).json()
+                if r.get("rows"):
+                    item["extract"] = {"fields": r["fields"], "rows": r["rows"], "pages_read": r["pages_read"]}
+                log(f"  {ex['kb_id']:<22} extract    {len(r.get('rows') or [])} rows from {r.get('pages_read')} pages")
         examples.append(item)
     models = sorted({a["done"].get("model") for e in examples for a in e["starters"] if a["done"].get("model")})
     data = {"version": 1, "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -114,6 +145,7 @@ def main_cli(argv=None) -> int:
     ap.add_argument("--out", type=Path, default=DEFAULT_OUT)
     ap.add_argument("--max-usd", type=float, default=0.15, help="stop asking the model after this spend (default 0.15)")
     ap.add_argument("--allow-partial", action="store_true", help="write even if some starters got no AI answer")
+    ap.add_argument("--no-starter-answers", action="store_true", help="do not write api/starter_answers.json")
     args = ap.parse_args(argv)
     if not llm.available():
         print("OPENROUTER_API_KEY is not set: the answers must be real. See the docstring.", file=sys.stderr)
@@ -122,6 +154,12 @@ def main_cli(argv=None) -> int:
                                         ip_upload_cap=0))
     t0 = time.monotonic()
     data, problems = build(TestClient(app))
+    rows = []
+    for e in data["examples"]:
+        for a in e["starters"] + list((e.get("followup_answers") or {}).values()):
+            if a["done"]["status"] in ("answered", "cached"):
+                rows.append({"kb_id": e["kb_id"], "question": a["q"], "text": a["text"], "followups": a["followups"],
+                             "cited": a["done"]["cited"]})
     spent = app.state.budget.snapshot()["spent_usd"]
     body = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
     n = sum(len(e["starters"]) for e in data["examples"])
@@ -137,6 +175,9 @@ def main_cli(argv=None) -> int:
     tmp.write_text(body + "\n", encoding="utf-8")
     tmp.replace(args.out)
     print(f"Wrote {args.out}")
+    if not args.no_starter_answers:
+        STARTER_ANSWERS.write_text(json.dumps(rows, ensure_ascii=False, indent=0) + "\n", encoding="utf-8")
+        print(f"Wrote {STARTER_ANSWERS} ({len(rows)} cached answers)")
     return 0
 
 

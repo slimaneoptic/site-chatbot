@@ -3,17 +3,25 @@
 Run from the repo root:  uvicorn api.main:app --port 8000
 
 Endpoints
-  GET  /healthz                    -> {ok, ai, kbs, budget}
+  GET  /healthz                    -> {ok, ai, kbs, budget, inst (8-hex id of this instance), up_s, ai_key
+                                      ("ok" | "missing" | "rejected" | "unchecked"), restore (KB_SECRET set)}
   GET  /api/examples               -> pre-indexed example sources (eval/fixtures) + starter questions,
                                       with the cached answer of each starter when the shared cache has one
   POST /api/kb                     -> JSON {url, max_pages?} or multipart PDFs (field "files")
                                       -> {kb_id, label, kind, url, lang, pages, words, warnings,
-                                          page_list:[{title, url}] (first 20 pages, crawl order)}
+                                          page_list:[{title, url, rendered}] (first 20 pages, crawl order),
+                                          starters:[0-4 checked questions in the site's language], rendered:int,
+                                          snapshot (only when the body has snapshot:true and the pages are <= 900 KB:
+                                          opaque and signed; the front sends it back unchanged as `restore`)}
+       Any JSON body may be sent as text/plain (no CORS preflight).
        Daily per-IP caps: site reads IP_CRAWL_CAP (429 error code ip_crawl_cap), PDF uploads IP_UPLOAD_CAP
        (429 error code ip_upload_cap).
        Crawl progress: send the same POST with ?stream=1 (or Accept: text/event-stream). The answer is then
        an SSE stream: progress{n, url} (one per page read) ... then done{<the JSON above>} or error{code, message}.
-  POST /api/chat {kb_id, messages:[{role, content}], session_id}
+  POST /api/chat {kb_id, messages:[{role, content}], session_id, restore?}
+       restore = the snapshot from /api/kb, sent only when retrying after kb_expired: a valid one rebuilds the KB
+       under the same kb_id (no crawl, no AI; IP_RESTORE_CAP per IP per day -> ip_restore_cap), an invalid one
+       gives kb_expired again. Bodies over 256 KB are accepted only with restore, up to 1 MB (else too_big).
        -> SSE, always in this order: meta{lang, dir, pages} . sources[{n, title, url, passage, hl, hl_at, terms}]
           (hl = best sentence of the passage, hl_at = [start, end] of hl in passage as JavaScript string
           indices (UTF-16 code units) or null)
@@ -25,7 +33,9 @@ Endpoints
           Fatal problems send only error{code, message} (codes: kb_expired, bad_request, server_error).
           kb_expired: the client re-reads the site from its saved URL (POST /api/kb) and asks again.
           notice codes (non-fatal, the answer still follows as passages): session_cap, ip_cap,
-          global_budget, ai_busy.
+          global_budget, ai_busy, ai_unavailable (the key is missing or rejected).
+          done.closest = {title, url} of the nearest page when the site does not answer (else null).
+          Pinned examples: an exact cached question (starter or follow-up chip) is served from the cache mid-chat.
   POST /api/extract {kb_id, fields}  -> {kb_id, fields, rows:[{<label>: value, ..., source:{url, title}}],
                                          pages_read, warnings} (or {error:{code, message}})
        Multipart uploads are counted while they stream: over MAX_UPLOAD_MB -> 413 too_big even without a
@@ -34,17 +44,23 @@ Endpoints
   GET  /api/kb/{id}.csv            -> the last extracted rows as CSV (or the page list when nothing was extracted)
 
 Env: CORS_ORIGINS (comma list, default https://slimanechanchoul.com), CORS_ORIGIN_REGEX (default any
-http://localhost:* / 127.0.0.1:*), SESSION_CAP, IP_CAP, DAILY_USD, IP_CRAWL_CAP, IP_UPLOAD_CAP (10 PDF uploads per IP per day), KB_TTL_S (3600),
+http://localhost:* / 127.0.0.1:*); a POST whose Origin header matches neither gets 403 origin_not_allowed (text/plain
+bodies skip the CORS preflight, so CORS alone would not stop another site's page from spending the caps), SESSION_CAP, IP_CAP, DAILY_USD, IP_CRAWL_CAP, IP_UPLOAD_CAP (10 PDF uploads per IP per day), KB_TTL_S (3600),
 KB_MAX (40), MAX_PAGES (15), EXTRACT_MAX_PAGES (5), MAX_UPLOAD_MB (20), STARTER_ANSWERS (json file),
 TRUSTED_PROXY_HOPS (1: the per-IP caps use the X-Forwarded-For entry our proxy added, never the visitor's own),
-CLIENT_IP_HEADER (optional platform header with the visitor address), OPENROUTER_API_KEY.
+CLIENT_IP_HEADER (optional platform header with the visitor address), OPENROUTER_API_KEY (spaces/quotes trimmed),
+KB_SECRET (32+ random bytes; needed for restore across instances), IP_RESTORE_CAP (60), JINA_API_KEY (optional),
+JINA_RPM (20), JS_MAX_PAGES (8; rendered pages count inside MAX_PAGES).
 """
 from __future__ import annotations
 
 import csv
+import hashlib
+import hmac
 import io
 import json
 import os
+import secrets
 import queue
 import re
 import sys
@@ -72,6 +88,7 @@ import extract  # noqa: E402
 import llm  # noqa: E402
 import scraper  # noqa: E402
 import search  # noqa: E402
+import starters as starters_mod  # noqa: E402
 from scraper import Page  # noqa: E402
 
 FIXTURES = ROOT / "eval" / "fixtures"
@@ -94,8 +111,11 @@ MAX_HISTORY_CHARS = 4000  # per message; answer.py trims further for the model
 MESSAGES = {
     "kb_expired": "This site was read more than an hour ago and has been cleared. Reading it again now.",
     "bad_request": "Something was missing in that request. Please try again.",
+    "origin_not_allowed": "This API only answers requests from the demo pages it was built for.",
     "server_error": "Something went wrong on our side. Please try again in a minute.",
     "ai_busy": "The AI is busy right now, so here are the most relevant passages from the site instead.",
+    "ai_unavailable": "The AI is switched off on this demo right now, so here are the most relevant passages from the site instead.",
+    "ip_restore_cap": "This network has reopened many sites today. Read the site again, or come back tomorrow.",
     "extract_busy": "The AI is busy right now, so extraction stopped early. Please try again in a minute.",
     "no_file": "Add a PDF file or a website address.",
     "too_big": "That upload is too big for the demo.",
@@ -134,21 +154,100 @@ class KB:
     warnings: list[str] = field(default_factory=list)
     rows: list[dict] = field(default_factory=list)  # last extraction
     fields: list[str] = field(default_factory=list)
+    starters: list[str] = field(default_factory=list)  # checked starter questions in the site's language
+    rendered: int = 0  # pages read through the JavaScript page renderer
 
     @property
     def words(self) -> int:
         return sum(p.words for p in self.pages)
 
-    def summary(self) -> dict:
-        return {"kb_id": self.id, "label": self.label, "kind": self.kind, "url": self.start_url,
-                "lang": self.index.lang, "pages": len(self.pages), "words": self.words, "warnings": self.warnings,
-                "page_list": [{"title": p.title, "url": p.url} for p in self.pages[:PAGE_LIST_MAX]]}
+    def summary(self, snapshot: dict | None = None) -> dict:
+        out = {"kb_id": self.id, "label": self.label, "kind": self.kind, "url": self.start_url,
+               "lang": self.index.lang, "pages": len(self.pages), "words": self.words, "warnings": self.warnings,
+               "page_list": [{"title": p.title, "url": p.url, "rendered": bool(getattr(p, "rendered", False))}
+                             for p in self.pages[:PAGE_LIST_MAX]],
+               "starters": list(self.starters), "rendered": self.rendered}
+        if snapshot is not None:
+            out["snapshot"] = snapshot
+        return out
 
 
 def make_kb(pages: list[Page], label: str, kind: str, *, kb_id: str | None = None, start_url: str = "",
             warnings: list[str] | None = None) -> KB:
     return KB(kb_id or uuid.uuid4().hex[:12], label, kind, pages, search.Index(pages), cache_mod.source_id(pages),
               start_url, list(warnings or []))
+
+
+# ---------------------------------------------------------------- signed snapshots (restore on another instance)
+
+SNAPSHOT_MAX_BYTES = 900_000   # pages serialized above this: no snapshot
+SNAPSHOT_TTL_S = 24 * 3600
+SNAPSHOT_MAX_PAGES = 23
+MAX_RESTORE_BYTES = 1_000_000  # chat / extract body that carries a snapshot
+_PROCESS_SECRET = secrets.token_bytes(32)  # without KB_SECRET a snapshot only works on the instance that made it
+
+
+def _kb_secret() -> bytes:
+    env = os.environ.get("KB_SECRET", "")
+    return env.encode() if env else _PROCESS_SECRET
+
+
+def _snap_canon(label: str, kind: str, url: str, pages: list) -> bytes:
+    return json.dumps([label, kind, url, pages], ensure_ascii=False, separators=(",", ":")).encode()
+
+
+def _snap_sig(v: int, kb_id: str, exp: int, canon: bytes) -> str:
+    msg = f"{v}|{kb_id}|{exp}|{hashlib.sha256(canon).hexdigest()}".encode()
+    return hmac.new(_kb_secret(), msg, hashlib.sha256).hexdigest()
+
+
+def make_snapshot(kb: "KB", now: float) -> dict | None:
+    """Opaque signed copy of a KB's pages the front keeps and sends back after kb_expired; None when too big."""
+    pages = [{"url": p.url, "title": p.title, "text": p.text, "rendered": bool(getattr(p, "rendered", False))}
+             for p in kb.pages[:SNAPSHOT_MAX_PAGES]]
+    canon = _snap_canon(kb.label, kind := kb.kind, kb.start_url, pages)
+    if len(canon) > SNAPSHOT_MAX_BYTES:
+        return None
+    exp = int(now) + SNAPSHOT_TTL_S
+    return {"v": 1, "kb_id": kb.id, "label": kb.label, "kind": kind, "url": kb.start_url, "exp": exp, "pages": pages,
+            "sig": _snap_sig(1, kb.id, exp, canon)}
+
+
+def verify_snapshot(snap, kb_id: str, now: float) -> list[Page] | None:
+    """The snapshot's pages when its signature, kb_id and expiry are valid; None otherwise."""
+    try:
+        if not isinstance(snap, dict) or snap.get("v") != 1 or str(snap.get("kb_id")) != kb_id or not kb_id:
+            return None
+        exp = int(snap["exp"])
+        if exp < now or exp > now + SNAPSHOT_TTL_S + 60:
+            return None
+        pages = snap["pages"]
+        if not isinstance(pages, list) or not pages or len(pages) > SNAPSHOT_MAX_PAGES:
+            return None
+        canon = _snap_canon(snap["label"], snap["kind"], snap["url"], pages)
+        if not hmac.compare_digest(_snap_sig(1, kb_id, exp, canon), str(snap.get("sig", ""))):
+            return None
+        return [Page(str(p["url"]), str(p["title"]), str(p["text"]), bool(p.get("rendered"))) for p in pages]
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+class RestoreCap:
+    """Per-IP daily count of KB restores (IP_RESTORE_CAP)."""
+
+    def __init__(self, cap: int, clock=time.time):
+        self.cap, self._clock, self._lock = cap, clock, threading.Lock()
+        self._day, self._by_ip = "", {}
+
+    def take(self, ip: str) -> bool:
+        with self._lock:
+            day = time.strftime("%Y-%m-%d", time.gmtime(self._clock()))
+            if day != self._day:
+                self._day, self._by_ip = day, {}
+            if self._by_ip.get(ip, 0) >= self.cap:
+                return False
+            self._by_ip[ip] = self._by_ip.get(ip, 0) + 1
+            return True
 
 
 class KBStore:
@@ -261,6 +360,24 @@ async def _limited_form(request: Request, max_bytes: int):
     return await MultiPartParser(request.headers, body()).parse()
 
 
+async def _read_json(request: Request) -> dict:
+    """The JSON body (any Content-Type, e.g. text/plain to skip the CORS preflight). Bodies above MAX_JSON_BYTES are
+    accepted only when they carry a `restore` snapshot, up to MAX_RESTORE_BYTES. Raises _TooBig or ValueError."""
+    if _declared_size(request) > MAX_RESTORE_BYTES:
+        raise _TooBig
+    raw = b""
+    async for chunk in request.stream():
+        raw += chunk
+        if len(raw) > MAX_RESTORE_BYTES:
+            raise _TooBig
+    body = json.loads(raw.decode("utf-8") or "null")
+    if not isinstance(body, dict):
+        raise ValueError("not an object")
+    if len(raw) > MAX_JSON_BYTES and not body.get("restore"):
+        raise _TooBig
+    return body
+
+
 def _declared_size(request: Request) -> int:
     try:
         return int(request.headers.get("content-length") or 0)
@@ -360,32 +477,65 @@ def _left_today(bud, session: str, ip: str) -> int:
 
 # ---------------------------------------------------------------- app
 
+class _OriginGuard:
+    """Pure ASGI (streams pass through untouched): a POST that carries an Origin header outside the CORS list is
+    refused before any body is read, model called or cap counted. No Origin header (curl, server-to-server) passes."""
+
+    def __init__(self, app, allowed):
+        self.app, self.allowed = app, allowed
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope.get("method") == "POST":
+            origin = next((v.decode("latin-1") for k, v in scope.get("headers") or [] if k == b"origin"), None)
+            if origin is not None and not self.allowed(origin):
+                await _err("origin_not_allowed", status=403)(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
 def create_app(*, stream=None, translate=None, complete=None, crawl=None, clock=time.time,
-               budget: budget_mod.Budget | None = None) -> FastAPI:
-    """`stream`, `translate`, `complete`, `crawl` are injectable for tests (default: the real engine)."""
+               budget: budget_mod.Budget | None = None, quick=None, check_key: bool | None = None) -> FastAPI:
+    """`stream`, `translate`, `complete`, `crawl`, `quick` are injectable for tests (default: the real engine).
+    `quick(messages, schema) -> (data, usage)` makes the starter-question call."""
     app = FastAPI(title="Site chatbot API", docs_url=None, redoc_url=None)
     origins = [o.strip() for o in os.environ.get("CORS_ORIGINS", "https://slimanechanchoul.com").split(",") if o.strip()]
-    app.add_middleware(CORSMiddleware, allow_origins=origins,
-                       allow_origin_regex=os.environ.get("CORS_ORIGIN_REGEX", r"^http://(localhost|127\.0\.0\.1)(:\d+)?$"),
-                       allow_methods=["GET", "POST", "OPTIONS"], allow_headers=["Content-Type", "Accept"])
+    origin_regex = os.environ.get("CORS_ORIGIN_REGEX", r"^http://(localhost|127\.0\.0\.1)(:\d+)?$")
+    app.add_middleware(CORSMiddleware, allow_origins=origins, allow_origin_regex=origin_regex,
+                       allow_methods=["GET", "POST", "OPTIONS"], allow_headers=["Content-Type", "Accept"], max_age=7200)
+    origin_re = re.compile(origin_regex) if origin_regex else None
+    app.add_middleware(_OriginGuard, allowed=lambda o: "*" in origins or o in origins or
+                       bool(origin_re is not None and origin_re.fullmatch(o)))  # the same test CORSMiddleware makes
 
     st = app.state
     st.stream = stream or llm.stream_text
     st.translate = translate  # None -> llm.translate_query when a key is set
     st.complete = complete or llm.complete_json
     st.crawl = crawl or scraper.read_site
+    st.quick = quick
+    st.real_ai = stream is None
+    st.clock = clock
+    st.inst = secrets.token_hex(4)
+    st.boot = time.monotonic()
     st.budget = budget or budget_mod.Budget(session_cap=_env_int("SESSION_CAP", 12), ip_cap=_env_int("IP_CAP", 30),
                                             daily_usd=_env_float("DAILY_USD", 1.0),
                                             ip_crawl_cap=_env_int("IP_CRAWL_CAP", 5), clock=clock,
                                             ip_upload_cap=_env_int("IP_UPLOAD_CAP", 10))
+    st.restores = RestoreCap(_env_int("IP_RESTORE_CAP", 60), clock=clock)
     st.cache = cache_mod.AnswerCache(clock=clock)
     st.kbs = KBStore(max_entries=_env_int("KB_MAX", 40), ttl_s=_env_int("KB_TTL_S", 3600), clock=clock)
     st.examples = load_examples(st.kbs)
     _load_starter_answers(st)
+    if check_key is None:
+        check_key = st.real_ai and "PYTEST_CURRENT_TEST" not in os.environ
+    if check_key and llm.api_key():
+        llm.check_key_async()  # background: /healthz says "rejected" (and ai:false) for a bad key
 
     @app.get("/healthz")
     def healthz():
-        return {"ok": True, "ai": llm.available() or stream is not None, "kbs": len(st.kbs), "budget": st.budget.snapshot()}
+        key = llm.key_state() if st.real_ai else "ok"
+        return {"ok": True, "ai": (llm.available() and key not in ("missing", "rejected")) if st.real_ai else True,
+                "kbs": len(st.kbs), "budget": st.budget.snapshot(), "inst": st.inst,
+                "up_s": int(time.monotonic() - st.boot), "ai_key": key, "restore": bool(os.environ.get("KB_SECRET"))}
 
     @app.get("/api/examples")
     def examples():
@@ -403,6 +553,46 @@ def create_app(*, stream=None, translate=None, complete=None, crawl=None, clock=
                 starters.append(item)
             out.append({**kb.summary(), "starters": starters})
         return {"examples": out}
+
+    def _starters_quick():
+        if st.quick is not None:
+            return st.quick
+        if st.real_ai and llm.available():
+            return lambda messages, schema: llm.quick_json(messages, schema)
+        return None
+
+    def _start_starters(label: str, pages: list[Page]) -> dict:
+        """Start the starter-question call in a thread; returns a box that gets "qs" (and the cost is recorded)."""
+        box: dict = {"done": threading.Event()}
+        quick = _starters_quick()
+        if quick is None or not st.budget.can_spend():
+            box["done"].set()
+            return box
+
+        def work():
+            try:
+                lang = starters_mod.site_language(pages)
+                box["lang"] = lang
+                box["qs"], usage = starters_mod.ask_model(label, lang, pages, quick)
+                st.budget.add_spend(getattr(usage, "cost_usd", 0.0))
+            except Exception:  # noqa: BLE001 - templates fill in
+                box["qs"] = []
+            finally:
+                box["done"].set()
+
+        threading.Thread(target=work, daemon=True, name="starters").start()
+        return box
+
+    def _finish_starters(kb: KB, box: dict | None, wait_s: float = 3.2) -> None:
+        if box is not None:
+            box["done"].wait(wait_s)
+        try:
+            kb.starters = starters_mod.pick(kb.index, kb.pages, kb.label, (box or {}).get("qs"), (box or {}).get("lang"))
+        except Exception:  # noqa: BLE001
+            kb.starters = []
+
+    def _summary(kb: KB, want_snapshot: bool) -> dict:
+        return kb.summary(make_snapshot(kb, st.clock()) if want_snapshot else None)
 
     # ------------------------------------------------------------ read a site or PDFs
 
@@ -437,23 +627,27 @@ def create_app(*, stream=None, translate=None, complete=None, crawl=None, clock=
                 files.append(buf)
             if not files:
                 return _err("no_file")
+            want_snap = str(form.get("snapshot") or "").lower() in ("1", "true")
             pages, problems = docs.read_pdfs(files)
             if not pages:
                 return _err("no_text", "; ".join(problems) or MESSAGES["no_text"], status=422)
             kb = make_kb(pages, ", ".join(b.name for b in files), "pdf", warnings=problems)
+            from starlette.concurrency import run_in_threadpool
+            await run_in_threadpool(_finish_starters, kb, _start_starters(kb.label, pages))
             st.kbs.put(kb)
             if want_stream:
-                return sse_response(iter([sse("done", kb.summary())]))
-            return kb.summary()
+                return sse_response(iter([sse("done", _summary(kb, want_snap))]))
+            return _summary(kb, want_snap)
 
         if _declared_size(request) > MAX_JSON_BYTES:
             return _err("too_big", status=413)
         try:
-            body = await request.json()
-            if not isinstance(body, dict):
-                raise ValueError
+            body = await _read_json(request)
             url = body.get("url")
             max_pages = max(1, min(_env_int("MAX_PAGES", 15), int(body.get("max_pages") or 15)))
+            want_snap = body.get("snapshot") is True
+        except _TooBig:
+            return _err("too_big", status=413)
         except Exception:  # noqa: BLE001
             return _err("bad_request")
         try:
@@ -464,26 +658,41 @@ def create_app(*, stream=None, translate=None, complete=None, crawl=None, clock=
         if not decision.allowed:
             return _err(decision.reason, decision.message, status=429)
 
+        early: dict = {}
+
+        def on_kept(page: Page) -> None:  # 5 pages read: start the starter questions during the crawl tail
+            early.setdefault("pages", []).append(page)
+            if len(early["pages"]) == 5 and "box" not in early:
+                early["box"] = _start_starters(_url_label(start), list(early["pages"]))
+
+        def run_crawl(on_page=None):
+            if st.crawl is scraper.read_site:
+                return st.crawl(start, max_pages, on_page, on_kept=on_kept)
+            return st.crawl(start, max_pages, on_page)
+
         def finish(report) -> KB | None:
             if not report.pages:
                 return None
             kb = make_kb(report.pages, _url_label(report.start_url), "site", start_url=report.start_url,
                          warnings=report.warnings)
+            kb.rendered = int(getattr(report, "rendered", 0) or 0)
+            box = early.get("box") or _start_starters(kb.label, kb.pages)
+            _finish_starters(kb, box)
             st.kbs.put(kb)
             return kb
 
         st.budget.record_crawl(ip)  # right after the check, before any await: a burst can't all pass the check
         if not want_stream:
+            from starlette.concurrency import run_in_threadpool
             try:
-                from starlette.concurrency import run_in_threadpool
-                report = await run_in_threadpool(st.crawl, start, max_pages)
+                report = await run_in_threadpool(run_crawl)
             except scraper.CrawlError as e:
                 return _err(e.code, e.message, status=422)
-            kb = finish(report)
+            kb = await run_in_threadpool(finish, report)
             if kb is None:
                 code = "js_only" if report.js_only else "no_text"
                 return _err(code, (report.warnings or [scraper.MESSAGES[code]])[0], status=422)
-            return kb.summary()
+            return _summary(kb, want_snap)
 
         def events() -> Iterator[str]:
             q: queue.Queue = queue.Queue()
@@ -491,7 +700,7 @@ def create_app(*, stream=None, translate=None, complete=None, crawl=None, clock=
 
             def work():
                 try:
-                    box["report"] = st.crawl(start, max_pages, lambda n, u: q.put(("progress", {"n": n, "url": u})))
+                    box["report"] = run_crawl(lambda n, u: q.put(("progress", {"n": n, "url": u})))
                 except scraper.CrawlError as e:
                     box["error"] = {"code": e.code, "message": e.message}
                 except Exception:  # noqa: BLE001
@@ -511,31 +720,51 @@ def create_app(*, stream=None, translate=None, complete=None, crawl=None, clock=
                 code = "js_only" if report.js_only else "no_text"
                 yield sse("error", {"code": code, "message": (report.warnings or [scraper.MESSAGES[code]])[0]})
                 return
-            yield sse("done", kb.summary())
+            yield sse("done", _summary(kb, want_snap))
 
         return sse_response(events())
 
+    def _kb_or_restore(kb_id: str, snap, ip: str) -> tuple[KB | None, str | None]:
+        """(kb, None) or (None, error code). A missing KB is rebuilt from a valid signed snapshot (no crawl, no AI)."""
+        kb = st.kbs.get(kb_id)
+        if kb is not None or not snap:
+            return kb, (None if kb is not None else "kb_expired")
+        pages = verify_snapshot(snap, kb_id, st.clock())
+        if pages is None:
+            return None, "kb_expired"
+        if not st.restores.take(ip):
+            return None, "ip_restore_cap"
+        kb = make_kb(pages, str(snap.get("label") or ""), str(snap.get("kind") or "site"), kb_id=kb_id,
+                     start_url=str(snap.get("url") or ""))
+        kb.rendered = sum(1 for p in pages if p.rendered)
+        st.kbs.put(kb)
+        return kb, None
+
     # ------------------------------------------------------------ chat
+
+    def _sse_error(code: str) -> StreamingResponse:
+        return sse_response(iter([sse("error", {"code": code, "message": MESSAGES.get(code, MESSAGES["bad_request"])})]))
 
     @app.post("/api/chat")
     async def chat(request: Request):
         t0 = time.monotonic()
         ip = client_ip(request)
-        if _declared_size(request) > MAX_JSON_BYTES:
-            return sse_response(iter([sse("error", {"code": "bad_request", "message": MESSAGES["bad_request"]})]))
         try:
-            body = await request.json()
+            body = await _read_json(request)
             msgs = [{"role": m["role"], "content": m["content"][:MAX_HISTORY_CHARS]} for m in body.get("messages") or []
                     if isinstance(m, dict) and m.get("role") in ("user", "assistant") and isinstance(m.get("content"), str)]
             kb_id = str(body.get("kb_id") or "")
             session = str(body.get("session_id") or "")[:64] or f"ip:{ip}"
+        except _TooBig:
+            return _sse_error("too_big")
         except Exception:  # noqa: BLE001
-            return sse_response(iter([sse("error", {"code": "bad_request", "message": MESSAGES["bad_request"]})]))
+            return _sse_error("bad_request")
         if not msgs or msgs[-1]["role"] != "user" or not msgs[-1]["content"].strip():
-            return sse_response(iter([sse("error", {"code": "bad_request", "message": MESSAGES["bad_request"]})]))
-        kb = st.kbs.get(kb_id)
+            return _sse_error("bad_request")
+        from starlette.concurrency import run_in_threadpool
+        kb, code = await run_in_threadpool(_kb_or_restore, kb_id, body.get("restore"), ip)
         if kb is None:
-            return sse_response(iter([sse("error", {"code": "kb_expired", "message": MESSAGES["kb_expired"]})]))
+            return _sse_error(code or "kb_expired")
         question = msgs[-1]["content"].strip()[:MAX_QUESTION_CHARS]
         history = msgs[:-1][-MAX_HISTORY:]
         return sse_response(_chat_events(st, kb, question, history, session, ip, t0))
@@ -545,17 +774,16 @@ def create_app(*, stream=None, translate=None, complete=None, crawl=None, clock=
     @app.post("/api/extract")
     async def extract_endpoint(request: Request):
         ip = client_ip(request)
-        if _declared_size(request) > MAX_JSON_BYTES:
-            return _err("too_big", status=413)
         try:
-            body = await request.json()
-            if not isinstance(body, dict):
-                raise ValueError
+            body = await _read_json(request)
+        except _TooBig:
+            return _err("too_big", status=413)
         except Exception:  # noqa: BLE001
             return _err("bad_request")
-        kb = st.kbs.get(str(body.get("kb_id") or ""))
+        from starlette.concurrency import run_in_threadpool
+        kb, code = await run_in_threadpool(_kb_or_restore, str(body.get("kb_id") or ""), body.get("restore"), ip)
         if kb is None:
-            return _err("kb_expired", status=404)
+            return _err(code or "kb_expired", status=429 if code == "ip_restore_cap" else 404)
         raw = body.get("fields")
         fields = extract.parse_fields(", ".join(raw) if isinstance(raw, list) else str(raw or ""))
         if not fields:
@@ -563,7 +791,6 @@ def create_app(*, stream=None, translate=None, complete=None, crawl=None, clock=
         if st.complete is llm.complete_json and not llm.available():
             return _err("no_ai", status=503)
         session = str(body.get("session_id") or "")[:64] or f"ip:{ip}"
-        from starlette.concurrency import run_in_threadpool
         return await run_in_threadpool(_extract, st, kb, fields, session, ip)
 
     @app.get("/api/kb/{name}")
@@ -630,10 +857,10 @@ def _chat_events(st, kb: KB, question: str, history: list[dict], session: str, i
         prev = next((m["content"] for m in reversed(history) if m["role"] == "user"), None)
         translate = st.translate
         if translate is None and llm.available():
-            def translate(text: str, lang: str) -> str:
+            def translate(text: str, lang: str, hint: str = "") -> str:
                 if not bud.check(session, ip).allowed:
                     return text
-                return llm.translate_query(text, lang, on_usage=lambda u: bud.record(
+                return llm.translate_query(text, lang, hint=hint, on_usage=lambda u: bud.record(
                     session, ip, llm.Usage(u.prompt_tokens, u.completion_tokens, u.cost_usd, u.model, 0)))
         found = kb.index.search(question, prev_question=prev, translate=translate)
         passages = [search.trim_passage(p, found.search_query) for p in found.passages[:answer.MAX_PASSAGES]]
@@ -642,7 +869,8 @@ def _chat_events(st, kb: KB, question: str, history: list[dict], session: str, i
         # The highlight guess uses this question's own words (a follow-up's earlier question would pull it to the
         # wrong sentence); a cached answer is known already, so its sentences pick the highlight at once.
         own = question if search._content(search._tokens(question)) else found.search_query
-        pre = st.cache.get(kb.source, question) if not history and passages else None
+        any_turn = kb.kind == "example"  # pinned examples: an exact follow-up chip is cached even mid-chat
+        pre = st.cache.get(kb.source, question) if (not history or any_turn) and passages else None
         pre_hl = _hl_map(passages, pre.text, pre.cited) if pre is not None else {}
         sources = []
         for n, p in enumerate(passages, start=1):
@@ -653,7 +881,7 @@ def _chat_events(st, kb: KB, question: str, history: list[dict], session: str, i
         yield sse("sources", sources)
 
         run = answer.ask(kb.label, question, _Trimmed(found, passages), history, source=kb.source, session=session, ip=ip,
-                         cache=st.cache, budget=bud, stream=st.stream, trim=lambda p, q: p)
+                         cache=st.cache, budget=bud, stream=st.stream, trim=lambda p, q: p, cache_any_turn=any_turn)
         ttfw = None
         for chunk in run:
             if ttfw is None:
@@ -661,7 +889,10 @@ def _chat_events(st, kb: KB, question: str, history: list[dict], session: str, i
                 res = run.result  # set before the text for no_match / cached / extractive / early error
                 if res is not None and res.status in ("extractive", "error") and res.note:
                     code = _REASON_BY_MESSAGE.get(res.note, "ai_busy")
-                    yield sse("notice", {"code": code, "message": res.note if code != "ai_busy" else MESSAGES["ai_busy"]})
+                    if code == "ai_busy" and st.real_ai and llm.key_state() in ("missing", "rejected"):
+                        code = "ai_unavailable"
+                    yield sse("notice", {"code": code, "message": res.note if code not in ("ai_busy", "ai_unavailable")
+                                         else MESSAGES[code]})
             if chunk:
                 yield sse("delta", {"text": chunk})
         res = run.result
@@ -675,11 +906,35 @@ def _chat_events(st, kb: KB, question: str, history: list[dict], session: str, i
                            # the sentence each cited source really backs, picked from the answer: the page
                            # moves the source card's highlight to it ({"<n>": {hl, hl_at}})
                            "hl": _hl_map(passages, res.text, res.cited) if res and res.status in ("answered", "cached")
-                           else {}})
+                           else {},
+                           "closest": _closest(kb, question, res)})
     except Exception:  # noqa: BLE001 - never a stack trace to the visitor
         import logging
         logging.getLogger(__name__).exception("chat failed")
         yield sse("error", {"code": "server_error", "message": MESSAGES["server_error"]})
+
+
+_NOT_FOUND = re.compile(
+    r"couldn't find|could not find|can't find|cannot find|not (?:mentioned|covered|listed|available) (?:on|in)|"
+    r"no information|doesn't (?:say|mention)|does not (?:say|mention)|je n'ai pas trouvé|n'ai pas pu trouver|"
+    r"je ne trouve pas|ne trouve pas|pas d'information|ne (?:mentionne|précise|contient) pas|"
+    r"لم أتمكن من العثور|لم أجد|لا تتوفر|لا توجد معلومات|لا يذكر|لم يتم ذكر|غير متوفرة", re.I)
+
+
+def _closest(kb: KB, question: str, res) -> dict | None:
+    """{title, url} of the nearest page when the site does not answer the question (no_match, or an answer that
+    says it could not find it); None otherwise."""
+    if res is None:
+        return None
+    if not (res.status == "no_match" or (res.status in ("answered", "cached") and _NOT_FOUND.search(res.text[:400]))):
+        return None
+    try:
+        p = kb.index.closest(question)
+    except Exception:  # noqa: BLE001
+        return None
+    if p is None or not p.url.startswith(("http://", "https://")):
+        return None
+    return {"title": p.title, "url": p.url}
 
 
 def _answerable(kb: KB, followups: list[str], question: str) -> list[str]:

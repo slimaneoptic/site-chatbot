@@ -168,7 +168,8 @@ def answer_question(index: Index, site: str, source: str, question: str) -> dict
     ai_on = ai_available()
     allowed = BUDGET.check(SID, IP).allowed
     tr_usage: list[llm.Usage] = []
-    translate = (lambda text, lang: llm.translate_query(text, lang, on_usage=tr_usage.append)) if ai_on and allowed else None
+    translate = (lambda text, lang, hint="": llm.translate_query(text, lang, hint=hint, on_usage=tr_usage.append)) \
+        if ai_on and allowed else None
     found = index.search(question, prev_question=prev_q, translate=translate)
     for u in tr_usage:  # the translation costs money but is not an answer: cost only, no question counted
         BUDGET.record(SID, IP, llm.Usage(cost_usd=u.cost_usd, model=u.model))

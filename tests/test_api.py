@@ -349,7 +349,7 @@ def test_page_list_in_kb_json_stream_done_pdf_and_examples(monkeypatch):
     client, _, _ = make(crawl=crawl, budget=Budget(ip_crawl_cap=9))
     js = client.post("/api/kb", json={"url": "c.example"}).json()
     assert len(js["page_list"]) == 20 and js["pages"] == 25
-    assert js["page_list"][0] == {"title": "Title 0", "url": "https://c.example/p0"}
+    assert js["page_list"][0] == {"title": "Title 0", "url": "https://c.example/p0", "rendered": False}
     assert [p["title"] for p in js["page_list"]] == [f"Title {i}" for i in range(20)]  # crawl order
     done = [d for e, d in events(client.post("/api/kb?stream=1", json={"url": "c.example"})) if e == "done"][0]
     assert done["page_list"] == js["page_list"]
@@ -357,7 +357,7 @@ def test_page_list_in_kb_json_stream_done_pdf_and_examples(monkeypatch):
     pdf = client.post("/api/kb", files={"files": ("guide.pdf", b"%PDF", "application/pdf")}).json()
     assert [p["url"] for p in pdf["page_list"]] == ["guide.pdf#page=1", "guide.pdf#page=2", "guide.pdf#page=3"]
     for ex in client.get("/api/examples").json()["examples"]:
-        assert ex["page_list"] and set(ex["page_list"][0]) == {"title", "url"}
+        assert ex["page_list"] and set(ex["page_list"][0]) == {"title", "url", "rendered"}
 
 
 def test_sources_hl_at_is_a_javascript_span_of_hl():
@@ -389,7 +389,7 @@ def test_export_examples_keeps_the_live_stream_shape():
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
     import export_examples as exp
     client, fake, _ = make(budget=Budget(session_cap=99, ip_cap=99))
-    data, problems = exp.build(client, log=lambda *a: None)
+    data, problems = exp.build(client, log=lambda *a: None, followups=False, extract=False)
     assert not problems and fake.calls == sum(len(e["starters"]) for e in data["examples"])
     shop = next(e for e in data["examples"] if e["kb_id"] == "ex-shop")
     assert set(shop) == {"kb_id", "label", "kind", "url", "lang", "pages", "words", "page_list", "starters"}
@@ -485,3 +485,18 @@ def test_fastapi_example_has_no_terminal_markup():
     client, fake, _ = make()
     ev = dict(ask(client, "Which command starts the development server?", kb="ex-fastapi_tutorial"))
     assert ev["sources"] and not any("<font" in s["passage"] or "<span" in s["passage"] for s in ev["sources"])
+
+
+def test_export_adds_followup_answers_and_extract_tables():
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+    import export_examples as exp
+    rows = [{"fee or rule": "Shipping", "amount": "35 MAD", "details": "free over 500 MAD"}]
+    client, fake, _ = make(budget=Budget(session_cap=999, ip_cap=999),
+                           complete=lambda m, schema, name="result": ({"rows": rows}, "fake/model"))
+    data, problems = exp.build(client, log=lambda *a: None)
+    shop = next(e for e in data["examples"] if e["kb_id"] == "ex-shop")
+    assert set(shop["followup_answers"]) == {"Is it free?", "Can I track it?"}
+    a = shop["followup_answers"]["Is it free?"]
+    assert set(a) == {"q", "meta", "sources", "notice", "text", "followups", "done"}
+    assert shop["extract"]["fields"] == ["fee or rule", "amount", "details"] and shop["extract"]["rows"]
+    assert next(e for e in data["examples"] if e["kb_id"] == "ex-python_tutorial")["extract"] is None

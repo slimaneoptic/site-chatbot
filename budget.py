@@ -113,6 +113,18 @@ class Budget:
                 self._by_session[session] = self._by_session.get(session, 0) + 1
                 self._by_ip[ip] = self._by_ip.get(ip, 0) + 1
 
+    def can_spend(self) -> bool:
+        """True while today's global budget has room (extras such as starter questions use only this)."""
+        with self._lock:
+            self._reset_if_new_day()
+            return self._spent + RESERVE_USD * len(self._pending) < self.daily_usd
+
+    def add_spend(self, usd: float) -> None:
+        """Add a cost to today's global spend without counting a question for anyone."""
+        with self._lock:
+            self._reset_if_new_day()
+            self._spent += max(0.0, float(usd or 0.0))
+
     def check_crawl(self, ip: str) -> BudgetDecision:
         with self._lock:
             self._reset_if_new_day()

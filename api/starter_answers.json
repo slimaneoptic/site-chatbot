@@ -1,0 +1,754 @@
+[
+{
+"kb_id": "ex-shop",
+"question": "How long does delivery to Casablanca take?",
+"text": "Delivery to Casablanca takes 1 to 2 working days [1].\n\n",
+"followups": [
+"How long does delivery to Rabat take?",
+"What are the delivery times for other cities?",
+"Do you deliver everywhere in Morocco?"
+],
+"cited": [
+1
+]
+},
+{
+"kb_id": "ex-shop",
+"question": "How many days do I have to return an item?",
+"text": "You have 14 days from delivery to return any unused item for a full refund [1]. Please ensure items are in their original packaging [1].\n\n",
+"followups": [
+"How much is the return fee?",
+"How do I start a return?",
+"Which items cannot be returned?"
+],
+"cited": [
+1
+]
+},
+{
+"kb_id": "ex-shop",
+"question": "Can I pay cash on delivery?",
+"text": "Yes, you can pay cash on delivery for orders within Morocco, up to a maximum amount of 3,000 MAD [1]. \n\n",
+"followups": [
+"Which bank cards are accepted?",
+"Can I pay via PayPal?",
+"How do business customers pay?"
+],
+"cited": [
+1
+]
+},
+{
+"kb_id": "ex-shop",
+"question": "What is your WhatsApp number?",
+"text": "Our WhatsApp number is +212 600 000 111 [2]. We answer messages within one hour during our opening hours, Monday to Saturday from 9 am to 7 pm [2].\n\n",
+"followups": [
+"What are your opening hours?",
+"How do I start a return?",
+"What is your email address?"
+],
+"cited": [
+2
+]
+},
+{
+"kb_id": "ex-shop",
+"question": "How long does delivery to Rabat take?",
+"text": "Delivery to Rabat takes 1 to 2 working days [1]. \n\n",
+"followups": [
+"How long does delivery to Casablanca take?",
+"What is the delivery time for other cities?",
+"Do you deliver everywhere in Morocco?"
+],
+"cited": [
+1
+]
+},
+{
+"kb_id": "ex-shop",
+"question": "What are the delivery times for other cities?",
+"text": "Delivery to other cities takes 2 to 4 working days [1].\n\n",
+"followups": [
+"How much is shipping?",
+"How long for Casablanca delivery?",
+"When is shipping free?"
+],
+"cited": [
+1
+]
+},
+{
+"kb_id": "ex-shop",
+"question": "Do you deliver everywhere in Morocco?",
+"text": "Yes, we deliver everywhere in Morocco [1]. Orders to Casablanca, Rabat, and Marrakech arrive within 1 to 2 working days [1].\n\n",
+"followups": [
+"How long does delivery take to Casablanca?",
+"What are the delivery times for Rabat?"
+],
+"cited": [
+1
+]
+},
+{
+"kb_id": "ex-shop",
+"question": "How much is the return fee?",
+"text": "The return fee is 25 MAD, which is deducted from your refund [1]. However, return shipping is completely free if the item is faulty or if we sent the wrong product [1].\n\n",
+"followups": [
+"How do I start a return?",
+"What items cannot be returned?",
+"How long do refunds take?"
+],
+"cited": [
+1
+]
+},
+{
+"kb_id": "ex-shop",
+"question": "How do I start a return?",
+"text": "To start a return, message us on WhatsApp with your order number [1]. Please make sure the item is unused and in its original packaging within 14 days of delivery [1].\n\n",
+"followups": [
+"What items cannot be returned?",
+"How much is the return fee?",
+"When will I receive my refund?"
+],
+"cited": [
+1
+]
+},
+{
+"kb_id": "ex-shop",
+"question": "Which items cannot be returned?",
+"text": "For hygiene reasons, cushion inserts and opened candles cannot be returned [1]. Additionally, all returned items must be unused and in their original packaging within 14 days of delivery [1].\n\n",
+"followups": [
+"How to start a return?",
+"What is the return fee?",
+"How long do refunds take?"
+],
+"cited": [
+1
+]
+},
+{
+"kb_id": "ex-shop",
+"question": "Which bank cards are accepted?",
+"text": "We accept Visa and Mastercard bank cards for payment [1]. All card payments are securely processed by CMI with 3-D Secure, and we never store your card details [1].\n\n",
+"followups": [
+"Is cash on delivery available?",
+"Can I pay with PayPal?",
+"How do business payments work?"
+],
+"cited": [
+1
+]
+},
+{
+"kb_id": "ex-shop",
+"question": "Can I pay via PayPal?",
+"text": "Yes, we accept PayPal, but only for orders placed from outside Morocco [1]. \n\n",
+"followups": [
+"Can I pay with cash on delivery?",
+"Which bank cards are accepted?",
+"Can business customers pay by bank transfer?"
+],
+"cited": [
+1
+]
+},
+{
+"kb_id": "ex-shop",
+"question": "How do business customers pay?",
+"text": "Business customers can pay by bank transfer for orders over 5,000 MAD. In this case, we send a proforma invoice first [1].\n\n",
+"followups": [
+"What is the VAT rate?",
+"Do you store card numbers?"
+],
+"cited": [
+1
+]
+},
+{
+"kb_id": "ex-shop",
+"question": "What are your opening hours?",
+"text": "Our customer service is open Monday to Saturday from 9 am to 7 pm [1]. If you would like to visit our showroom, it is open Tuesday to Sunday from 10 am to 8 pm [1]. \n\n",
+"followups": [
+"What is the showroom address?",
+"What is your WhatsApp number?"
+],
+"cited": [
+1
+]
+},
+{
+"kb_id": "ex-shop",
+"question": "What is your email address?",
+"text": "You can reach us by email at help@atlas-home.example [1]. \n\n",
+"followups": [
+"What is your WhatsApp number?",
+"Where is your showroom?",
+"How do I track my order?"
+],
+"cited": [
+1
+]
+},
+{
+"kb_id": "ex-shop_ar",
+"question": "هل يمكنني إرجاع المنتج واسترداد أموالي؟",
+"text": "نعم، يمكنك إرجاع أي منتج غير مستعمل خلال 14 يوماً من تاريخ الاستلام واسترداد كامل المبلغ [1]. يُشترط أن يكون المنتج في غلافه الأصلي، ولا يمكن إرجاع العطور المفتوحة لأسباب صحية [1]. سيُعاد المبلغ إلى وسيلة الدفع الأصلية خلال 7 أيام عمل [1].\n\n",
+"followups": [
+"كم يستغرق استرداد المبلغ؟",
+"هل يمكن إرجاع العطور المفتوحة؟"
+],
+"cited": [
+1
+]
+},
+{
+"kb_id": "ex-shop_ar",
+"question": "كم يستغرق التوصيل؟",
+"text": "يستغرق توصيل الطلبات إلى جميع مدن المغرب من 2 إلى 4 أيام عمل [1]. وستصلك رسالة نصية برقم التتبع بمجرد خروج الطرد من المخزن [1].\n\n",
+"followups": [
+"كم تكلفة التوصيل؟",
+"هل التوصيل مجاني؟"
+],
+"cited": [
+1
+]
+},
+{
+"kb_id": "ex-shop_ar",
+"question": "هل يمكنني الدفع عند الاستلام؟",
+"text": "نعم، نقبل الدفع عند الاستلام في جميع المدن، كما نوفر أيضاً خيار الدفع عبر البطاقات البنكية فيزا وماستركارد [1].\n\n",
+"followups": [
+"ما هي شروط الإرجاع؟",
+"كم يستغرق استرداد المبلغ؟"
+],
+"cited": [
+1
+]
+},
+{
+"kb_id": "ex-shop_ar",
+"question": "ما هو رقم الواتساب للتواصل معكم؟",
+"text": "يمكنكم التواصل معنا عبر الواتساب على الرقم 0600000222، وذلك من يوم الإثنين إلى السبت [1].\n\n",
+"followups": [
+"ما هي أوقات التواصل؟",
+"هل الدفع بالبطاقة آمن؟"
+],
+"cited": [
+1
+]
+},
+{
+"kb_id": "ex-shop_ar",
+"question": "كم يستغرق استرداد المبلغ؟",
+"text": "يُعاد المبلغ المسترد إلى وسيلة الدفع الأصلية خلال 7 أيام عمل [1]. يُشترط أن يكون المنتج غير مستعمل وفي غلافه الأصلي وضمن فترة الإرجاع المحددة [1].\n\n",
+"followups": [
+"ما هي مدة الإرجاع؟",
+"هل يمكن إرجاع العطور؟",
+"ما هي شروط الإرجاع؟"
+],
+"cited": [
+1
+]
+},
+{
+"kb_id": "ex-shop_ar",
+"question": "هل يمكن إرجاع العطور المفتوحة؟",
+"text": "لا يمكن إرجاع العطور المفتوحة لأسباب صحية؛ حيث يُشترط أن يكون المنتج غير مستعمل وفي غلافه الأصلي لإتمام الإرجاع [1].\n\n",
+"followups": [
+"ما هي مهلة الإرجاع؟",
+"متى يُسترد المبلغ؟"
+],
+"cited": [
+1
+]
+},
+{
+"kb_id": "ex-shop_ar",
+"question": "كم تكلفة التوصيل؟",
+"text": "تبلغ تكلفة التوصيل 30 درهماً، ويكون التوصيل مجانياً للطلبات التي تزيد قيمتها عن 400 درهم [1].\n\n",
+"followups": [
+"ما هي مدة التوصيل؟",
+"هل التوصيل لجميع المدن؟"
+],
+"cited": [
+1
+]
+},
+{
+"kb_id": "ex-shop_ar",
+"question": "هل التوصيل مجاني؟",
+"text": "يكون التوصيل مجانياً للطلبات التي تتجاوز قيمتها 400 درهم، أما إذا كانت أقل من ذلك فتبلغ كلفة الشحن 30 درهماً [1]. نوصل الطلبات إلى كافة مدن المغرب خلال مدة تتراوح بين 2 و4 أيام عمل [1].\n\n",
+"followups": [
+"كم يستغرق التوصيل؟",
+"ما هي تكلفة التوصيل؟"
+],
+"cited": [
+1
+]
+},
+{
+"kb_id": "ex-shop_ar",
+"question": "ما هي شروط الإرجاع؟",
+"text": "شروط الإرجاع لدينا هي أن يكون المنتج غير مستعمل وفي غلافه الأصلي، وأن يتم طلب الإرجاع خلال 14 يوماً من تاريخ الاستلام [1]. يُرجى العلم أننا لا نقبل إرجاع العطور المفتوحة لأسباب صحية [1].\n\n",
+"followups": [
+"متى يُسترد المبلغ؟",
+"هل يمكن إرجاع العطور؟"
+],
+"cited": [
+1
+]
+},
+{
+"kb_id": "ex-shop_ar",
+"question": "ما هي أوقات التواصل؟",
+"text": "أوقات التواصل عبر واتساب (0600000222) متاحة من الإثنين إلى السبت [1].\n\n",
+"followups": [
+"ما هو رقم واتساب للتواصل؟",
+"هل الدفع بالبطاقة آمن؟"
+],
+"cited": [
+1
+]
+},
+{
+"kb_id": "ex-shop_ar",
+"question": "هل الدفع بالبطاقة آمن؟",
+"text": "نعم، الدفع بالبطاقة البنكية لدينا آمن تماماً، ونحن لا نحتفظ برقم بطاقتك [1]. نقبل بطاقات فيزا وماستركارد، كما نوفر خيار الدفع عند الاستلام في جميع المدن [1].\n\n",
+"followups": [
+"ما هي البطاقات المقبولة؟",
+"هل يتوفر الدفع عند الاستلام؟"
+],
+"cited": [
+1
+]
+},
+{
+"kb_id": "ex-python_tutorial",
+"question": "How do I exit the Python interpreter?",
+"text": "You can exit the interpreter by typing an end-of-file character: Control-D on Unix or Control-Z on Windows [1]. Alternatively, if that doesn't work, you can exit by typing `quit()` [1].\n\n",
+"followups": [
+"How do I invoke the interpreter?",
+"How to run a Python script?",
+"How to test command line editing?"
+],
+"cited": [
+1
+]
+},
+{
+"kb_id": "ex-python_tutorial",
+"question": "What does the break statement do in a loop?",
+"text": "The `break` statement breaks out of the innermost enclosing `for` or `while` loop [3]. When a loop is terminated by a `break`, any paired loop `else` clause will not be executed [1].\n\n",
+"followups": [
+"What does continue do?",
+"When does loop else execute?",
+"How does finally affect break?"
+],
+"cited": [
+3,
+1
+]
+},
+{
+"kb_id": "ex-python_tutorial",
+"question": "How do I read a file line by line?",
+"text": "To read a file line by line, you can loop over the file object, which is fast and memory efficient [2]:\n\n```python\nfor line in f:\n    print(line, end='')\n```\n\nAlternatively, you can call `f.readline()` to read a single line at a time [1], or use `f.readlines()` or `list(f)` to read all lines into a list [2].\n\n",
+"followups": [
+"How to write to a file?",
+"What does f.read() return?",
+"How to read all lines into a list?"
+],
+"cited": [
+2,
+1
+]
+},
+{
+"kb_id": "ex-python_tutorial",
+"question": "What is a list comprehension?",
+"text": "List comprehensions provide a concise way to create lists [2]. They are commonly used to make new lists where each element results from operations applied to members of another iterable, or to create a subsequence of elements that satisfy a specific condition [2]. They can also contain complex expressions, nested functions, or multiple `for` clauses [1].\n\n",
+"followups": [
+"Can list comprehensions be nested?",
+"How do set comprehensions work?",
+"What are generator expressions?"
+],
+"cited": [
+2,
+1
+]
+},
+{
+"kb_id": "ex-python_tutorial",
+"question": "How do I invoke the interpreter?",
+"text": "I couldn't find how to invoke the interpreter on the site. You might check a page like \"2. Using the Python Interpreter\" for that information.\n\n",
+"followups": [
+"How does __init__() work?",
+"How do I run unittest?"
+],
+"cited": []
+},
+{
+"kb_id": "ex-python_tutorial",
+"question": "How to run a Python script?",
+"text": "To run a Python script, execute `python scriptname.py <arguments>` at your command line [2]. You can also run modules as scripts using `python -m module [arg] ...` [1]. If you want to run a script and enter interactive mode immediately afterward, pass the `-i` option before the script name, like `python -i script.py` [1].\n\n",
+"followups": [
+"How to pass arguments?",
+"What does python -m do?",
+"How to enter interactive mode?"
+],
+"cited": [
+2,
+1
+]
+},
+{
+"kb_id": "ex-python_tutorial",
+"question": "How to test command line editing?",
+"text": "To check if command line editing is supported, type a word at the Python prompt and press the Left arrow key (or Control-b) [1]. If the cursor moves, command line editing is available [1]. If nothing happens or a sequence like `^[[D` or `^B` appears, it is not supported [2].\n\n",
+"followups": [
+"How to exit the interpreter?",
+"How to run Python scripts?",
+"How to execute Python commands via command line?"
+],
+"cited": [
+1,
+2
+]
+},
+{
+"kb_id": "ex-python_tutorial",
+"question": "What does continue do?",
+"text": "The `continue` statement continues with the next iteration of the enclosing loop [1]. If it is reached inside a `try` statement, any `finally` clause will execute just prior to the `continue` statement's execution [2]. \n\n",
+"followups": [
+"What does break do?",
+"How does finally affect break?",
+"What happens if finally executes continue?"
+],
+"cited": [
+1,
+2
+]
+},
+{
+"kb_id": "ex-python_tutorial",
+"question": "When does loop else execute?",
+"text": "A loop’s `else` clause executes when the loop finishes without hitting a `break` statement [2]. Specifically, in a `for` loop, it runs after the final iteration, while in a `while` loop, it runs after the loop condition becomes false [2]. It will not execute if the loop is terminated early by a `break`, `return`, or a raised exception [2, 3].\n\n",
+"followups": [
+"When does break skip else?",
+"How does while else work?",
+"How does try else compare?"
+],
+"cited": [
+2,
+3
+]
+},
+{
+"kb_id": "ex-python_tutorial",
+"question": "How does finally affect break?",
+"text": "If a `try` statement reaches a `break` statement, the `finally` clause executes just prior to that `break` statement's execution [1]. Furthermore, if the `finally` clause itself executes a `break` statement, any active exceptions are not re-raised [2].\n\n",
+"followups": [
+"What happens with return in finally?",
+"Are exceptions re-raised after finally?",
+"How does finally affect continue?"
+],
+"cited": [
+1,
+2
+]
+},
+{
+"kb_id": "ex-python_tutorial",
+"question": "How to write to a file?",
+"text": "To write to a file, use `f.write(string)`, which writes the string's contents to the file and returns the number of characters written [1]. Other types of objects must first be converted before writing—either to a string (in text mode) using `str()` or to a bytes object (in binary mode) [1, 2].\n\n",
+"followups": [
+"How to change file position?",
+"How to read lines from a file?",
+"What does f.tell() return?"
+],
+"cited": [
+1,
+2
+]
+},
+{
+"kb_id": "ex-python_tutorial",
+"question": "What does f.read() return?",
+"text": "Calling `f.read()` reads and returns the file's contents [1]. If a `size` argument is given, it returns at most `size` characters (in text mode) or `size` bytes (in binary mode) [1]. If the end of the file has been reached, it returns an empty string (`''`) [1].\n\n",
+"followups": [
+"What does f.readline() return?",
+"What happens when reading a closed file?",
+"How does f.close() work?"
+],
+"cited": [
+1
+]
+},
+{
+"kb_id": "ex-python_tutorial",
+"question": "How to read all lines into a list?",
+"text": "To read all the lines of a file into a list, you can use `list(f)` or `f.readlines()` [1]. \n\n",
+"followups": [
+"How to loop over lines?",
+"What does readline return?",
+"How to write to a file?"
+],
+"cited": [
+1
+]
+},
+{
+"kb_id": "ex-python_tutorial",
+"question": "Can list comprehensions be nested?",
+"text": "Yes, list comprehensions can be nested [1]. The initial expression in a list comprehension can be any arbitrary expression, including another list comprehension, which can be used for tasks like transposing a matrix [1], [2].\n\n",
+"followups": [
+"How to transpose a matrix?",
+"Can set comprehensions be nested?",
+"How to flatten a list?"
+],
+"cited": [
+1,
+2
+]
+},
+{
+"kb_id": "ex-python_tutorial",
+"question": "How do set comprehensions work?",
+"text": "Similarly to list comprehensions, set comprehensions allow you to construct sets using an expression followed by a `for` clause and optional `if` conditions, enclosed in curly braces [1], [2]. They also support unpacking using the `*` operator, such as `{ *fruit for fruit in fruits }` [2].\n\n",
+"followups": [
+"Can you unpack sets?",
+"What are generator expressions?",
+"What operations do sets support?"
+],
+"cited": [
+1,
+2
+]
+},
+{
+"kb_id": "ex-python_tutorial",
+"question": "What are generator expressions?",
+"text": "Generator expressions are simple generators coded succinctly as expressions using a syntax similar to list comprehensions, but with parentheses instead of square brackets [1]. They are designed to be used right away by an enclosing function [1]. While they are more compact and less versatile than full generator definitions, they tend to be more memory friendly than equivalent list comprehensions [1].\n\n",
+"followups": [
+"When can parentheses be omitted?",
+"How do generators work?",
+"What exception do generators raise?"
+],
+"cited": [
+1
+]
+},
+{
+"kb_id": "ex-fastapi_tutorial",
+"question": "How do I declare a path parameter?",
+"text": "You can declare path parameters using the same syntax as Python format strings in your path operation decorator, like `@app.get(\"/items/{item_id}\")` [3]. The parameter is then passed directly as an argument to your path operation function, where you can also declare its type using standard Python type annotations (e.g., `async def read_item(item_id: int):`) [1, 3].\n\n",
+"followups": [
+"How to add metadata to path parameters?",
+"How to match a parameter containing a path?",
+"How to use Annotated with Path?"
+],
+"cited": [
+3,
+1
+]
+},
+{
+"kb_id": "ex-fastapi_tutorial",
+"question": "How do I make a query parameter optional?",
+"text": "To make a query parameter optional, declare a default value for it [1, 2]. If you do not want to provide a specific value, you can simply set its default to `None` (for example, `q: str | None = None`) [1, 2]. \n\n",
+"followups": [
+"How to make query parameters required?",
+"How to validate query strings?",
+"How to add default values?"
+],
+"cited": [
+1,
+2
+]
+},
+{
+"kb_id": "ex-fastapi_tutorial",
+"question": "How do I limit a query parameter to 50 characters?",
+"text": "To limit a query parameter to 50 characters, use `Query(max_length=50)` from `fastapi` [1, 3]. You can define it using `Annotated[str | None, Query(max_length=50)] = None` or as a default value `Query(default=None, max_length=50)` [1, 3].\n\n",
+"followups": [
+"How to set query defaults?",
+"How to make query parameters required?",
+"What are query parameters?"
+],
+"cited": [
+1,
+3
+]
+},
+{
+"kb_id": "ex-fastapi_tutorial",
+"question": "Which command starts the development server?",
+"text": "You can run the development server using the command `fastapi dev` (or `uv run fastapi dev`) [1, 2, 3].\n\n",
+"followups": [
+"What command is used for production?",
+"What is the default documentation URL?",
+"What VS Code extension is available?"
+],
+"cited": [
+1,
+2,
+3
+]
+},
+{
+"kb_id": "ex-fastapi_tutorial",
+"question": "How to add metadata to path parameters?",
+"text": "To add metadata to a path parameter, import `Path` from `fastapi` and use it to declare the metadata, such as a `title` [1, 2]. You can set it using `Annotated` (e.g., `item_id: Annotated[int, Path(title=\"The ID of the item to get\")]`) or directly as the parameter's default value with `Path(title=...)` [1, 2].\n\n",
+"followups": [
+"How to use Annotated?",
+"Can you add Query metadata?",
+"How to add numeric validations?"
+],
+"cited": [
+1,
+2
+]
+},
+{
+"kb_id": "ex-fastapi_tutorial",
+"question": "How to match a parameter containing a path?",
+"text": "To declare a path parameter that matches a full path, use Starlette's `:path` converter directly in the URL route, like `/files/{file_path:path}` [1]. In your path operation function, declare the parameter as a standard string: `read_file(file_path: str)` [1]. This allows the parameter to match path values like `home/johndoe/myfile.txt` [1, 2].\n\n",
+"followups": [
+"Does OpenAPI support path parameters containing paths?",
+"How does path matching order work?"
+],
+"cited": [
+1,
+2
+]
+},
+{
+"kb_id": "ex-fastapi_tutorial",
+"question": "How to use Annotated with Path?",
+"text": "To use `Annotated` with `Path`, import `Annotated` from `typing` and `Path` from `fastapi` [1, 2]. Then, declare your path parameter with its type and `Path()` inside `Annotated`, such as `item_id: Annotated[int, Path(title=\"The ID of the item to get\")]` [1, 2]. Using `Annotated` lets you add validations (like `ge` or `le`) without setting function parameter default values [1, 3].\n\n",
+"followups": [
+"How to validate numbers with Path?",
+"Can you mix Path and Query?",
+"Why use Annotated over default values?"
+],
+"cited": [
+1,
+2,
+3
+]
+},
+{
+"kb_id": "ex-fastapi_tutorial",
+"question": "How to make query parameters required?",
+"text": "To make a query parameter required, simply do not declare any default value for it [1, 2]. Having any default value, including `None`, makes the parameter optional [1, 2]. Even when using `Query` with validations, you make it required by omitting the default value [2].\n\n",
+"followups": [
+"How to make query parameters optional?",
+"How to validate query parameters with Query?",
+"How to set default values for parameters?"
+],
+"cited": [
+1,
+2
+]
+},
+{
+"kb_id": "ex-fastapi_tutorial",
+"question": "How to validate query strings?",
+"text": "To validate query strings, use `Query()` as a default value or inside `Annotated` in your path operation function [1, 2]. You can add validation constraints like `max_length` directly inside `Query()`, such as `q: str | None = Query(default=None, max_length=50)` [1, 2]. This will validate incoming data, return clear errors when invalid, and document the parameter in your OpenAPI schema [1].\n\n",
+"followups": [
+"How to set max_length?",
+"Can Query default be used in Annotated?",
+"How to make query parameters optional?"
+],
+"cited": [
+1,
+2
+]
+},
+{
+"kb_id": "ex-fastapi_tutorial",
+"question": "How to add default values?",
+"text": "To add default values, assign them directly to your parameters or model attributes [2, 4]. For query parameters or request body fields, providing a default value makes them optional; if you just want to make them optional without a specific value, set the default to `None` (for example, `description: str | None = None`) [2, 4].\n\n",
+"followups": [
+"How to make query parameters required?",
+"How to add string validations?",
+"How to install FastAPI?"
+],
+"cited": [
+2,
+4
+]
+},
+{
+"kb_id": "ex-fastapi_tutorial",
+"question": "How to set query defaults?",
+"text": "You can set a query parameter's default value directly in your function signature (e.g., `limit: int = 10` or `q: str | None = None` to make it optional) [1], [3]. If you use `Query()` for validation without `Annotated`, set the default using the parameter inside `Query()`, such as `q: str | None = Query(default=None)` [2], [4]. With `Annotated`, assign the default value to the function parameter itself [4].\n\n",
+"followups": [
+"How to make query parameters required?",
+"How to add string validations to query parameters?",
+"Can query parameters be converted to bool?"
+],
+"cited": [
+1,
+3,
+2,
+4
+]
+},
+{
+"kb_id": "ex-fastapi_tutorial",
+"question": "What are query parameters?",
+"text": "Query parameters are non-path parameters declared in your path operation function [3]. When you declare a default value for them, they are optional; if you do not declare a default value, they become required [1, 3]. You can also declare them explicitly using `Query` or group them together using a Pydantic model [1, 2].\n\n",
+"followups": [
+"How to make query parameters required?",
+"How to validate query parameters?",
+"How to group query parameters with Pydantic?"
+],
+"cited": [
+3,
+1,
+2
+]
+},
+{
+"kb_id": "ex-fastapi_tutorial",
+"question": "What command is used for production?",
+"text": "For production use, the command is `fastapi run` [1, 2].\n\n",
+"followups": [
+"Where is the documentation located?",
+"How to run in development mode?"
+],
+"cited": [
+1,
+2
+]
+},
+{
+"kb_id": "ex-fastapi_tutorial",
+"question": "What is the default documentation URL?",
+"text": "I couldn't find the exact default interactive documentation URL on the site; the closest relevant page where you might look is \"First Steps\" [3]. However, the alternative documentation provided by ReDoc is available at `http://127.0.0.1:8000/redoc` [3].\n\n",
+"followups": [
+"Where is the alternative documentation?",
+"What provides the interactive documentation?",
+"Can query parameters have defaults?"
+],
+"cited": [
+3
+]
+},
+{
+"kb_id": "ex-fastapi_tutorial",
+"question": "What VS Code extension is available?",
+"text": "FastAPI provides an official extension for VS Code (and Cursor) [1]. It includes features such as a path operation explorer, path operation search, CodeLens navigation in tests (jump to definition from tests), and FastAPI Cloud deployment and logs directly from your editor [1].\n\n",
+"followups": [
+"What does the VS Code extension do?",
+"How to deploy to FastAPI Cloud?",
+"Where should the entrypoint be defined?"
+],
+"cited": [
+1
+]
+}
+]

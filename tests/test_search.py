@@ -216,11 +216,37 @@ def test_french_question_on_english_site_uses_translation():
 def test_english_question_on_french_site_translates_into_french():
     fr = Index([Page("https://fr.example/livraison", "Livraison", "Nous livrons dans toute la France en 48 heures. Les frais de port sont offerts dès 50 euros."),
                 Page("https://fr.example/paiement", "Paiement", "Nous acceptons la carte bancaire et PayPal pour vous simplifier la vie.")])
-    q = "How long does shipping take?"
+    q = "How long does my parcel take to arrive?"
     tr = StubTranslate({q: "Livraison en France : combien d'heures ?"})
     found = fr.search(q, translate=tr)
     assert tr.calls == [(q, "fr")] and found.translated
     assert found.passages[0].url.endswith("/livraison")
+    # "shipping" has the synonym "livraison": found without a translation call
+    tr2 = StubTranslate({})
+    assert fr.search("How long does shipping take?", translate=tr2).passages[0].url.endswith("/livraison") and tr2.calls == []
+
+
+def test_synonyms_title_and_address_words_find_the_pricing_page():
+    pages = [Page("https://l.example/now", "Now", "We shipped a new inbox. Teams now cost less time in triage and review. " * 3),
+             Page("https://l.example/pricing", "Pricing", "Basic plan $10 per user/month. Business plan $16 per user/month. Free for small teams."),
+             Page("https://l.example/b", "Bakery", "Opening times: 8am to 5pm every day at Valencia Street.")]
+    idx = Index(pages)
+    assert idx.search("How much does Linear cost?").passages[0].url.endswith("/pricing")
+    assert idx.search("What are your opening hours?").passages[0].url.endswith("/b")
+
+
+def test_at_most_two_passages_per_page():
+    long = Page("https://s.example/korea", "Korea", "\n".join(f"Our Korea bakery {i} opens at 9am in Seoul district {i}. " * 12 for i in range(6)))
+    other = Page("https://s.example/cities", "Cities", "Bakery hours: San Francisco opens at 8am, closes 5pm.")
+    found = Index([long, other]).search("bakery opens am")
+    urls = [p.url for p in found.passages]
+    assert urls.count("https://s.example/korea") <= 2 and "https://s.example/cities" in urls
+
+
+def test_closest_page_for_an_unanswered_question():
+    idx = Index([Page("https://b.example/etre-contacte", "Être contacté", "Laissez vos coordonnées et un conseiller vous rappelle."),
+                 Page("https://b.example/cartes", "Cartes", "Nos cartes bancaires pour tous les besoins du quotidien.")])
+    assert idx.closest("Comment contacter le service client ?").url.endswith("/etre-contacte")
 
 
 def test_latin_translation_skipped_when_covered_or_same_language_or_unmarked():
@@ -285,3 +311,9 @@ def test_parts_only_add_after_the_whole_question_hits():
     assert [h.passage.url.rsplit("/", 1)[-1] for h in r.hits] == ["returns"]
     assert search.split_parts("How much is the return fee?") == []
     assert len(search.split_parts("كم سعر التوصيل وكم يوما يستغرق؟")) == 2
+
+
+def test_price_question_keeps_the_amount_lines_when_trimming():
+    p = Passage("https://l.example/pricing", "Pricing", "Linear Agent included.\nBasic\n$10 per user/month\nUnlimited issues.\nLinear Insights for teams.")
+    out = trim_passage(p, "How much does Linear cost?")
+    assert "$10 per user/month" in out.text

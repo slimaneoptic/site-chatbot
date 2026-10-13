@@ -11,13 +11,16 @@ MAX_CHARS = 12_000  # per page sent to the model
 
 def parse_fields(text: str) -> list[tuple[str, str]]:
     """'Product name, price, in stock?' -> [('product_name', 'Product name'), ...]"""
-    out, seen = [], set()
+    out, seen, labels = [], set(), set()
     for raw in text.split(","):
         label = raw.strip()
         key = re.sub(r"\W+", "_", label.lower()).strip("_")
-        if label and key and key not in seen:
+        if key and not key.isascii():  # JSON-schema property names stay ASCII (Arabic names gave empty tables)
+            key = re.sub(r"[^a-z0-9]+", "_", key.encode("ascii", "ignore").decode()).strip("_") or f"field_{len(out) + 1}"
+        if label and key and key not in seen and label not in labels:
             out.append((key, label))
             seen.add(key)
+            labels.add(label)
     return out[:MAX_FIELDS]
 
 

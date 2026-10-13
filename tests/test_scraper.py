@@ -79,6 +79,8 @@ def site(monkeypatch):
     """Install a fake site: site(routes) -> FakeSession."""
     monkeypatch.setattr(socket, "getaddrinfo", fake_dns)
     monkeypatch.setattr(scraper, "DELAY_S", 0)
+    monkeypatch.setattr(scraper, "FETCH_WORKERS", 1)  # deterministic order; parallel reads have their own tests
+    monkeypatch.setattr(scraper, "_JINA_BUCKET", scraper._Bucket())
 
     def install(routes):
         sess = FakeSession(routes)
@@ -152,8 +154,10 @@ def test_read_site_stays_in_folder_respects_robots_and_reports(site):
     assert report.start_url == "https://shop.test/help/"
     assert [p.url for p in report.pages] == ["https://shop.test/help/", "https://shop.test/help/shipping.html", "https://shop.test/help/returns.html"]
     assert seen[-1] == (3, "https://shop.test/help/returns.html")
-    assert report.stopped == "done" and report.js_only is False and report.fetched == 3
-    assert not any("private" in c or "about" in c or "other.test" in c or c.endswith(".pdf") for c in sess.calls)
+    # /about.html is outside the folder but a key page linked from the start page: one hop is allowed (404 here)
+    assert report.stopped == "done" and report.js_only is False and report.fetched == 4
+    assert "https://shop.test/about.html" in sess.calls
+    assert not any("private" in c or "other.test" in c or c.endswith(".pdf") or "jina" in c for c in sess.calls)
     assert any("robots.txt" in w for w in report.warnings)
 
 
@@ -233,7 +237,7 @@ def test_thin_pages_count_toward_fetch_cap(site):
     sess = site(routes)
     report = read_site("https://shop.test/p0", 2)
     assert report.pages == [] and report.stopped == "max_fetches"
-    assert report.fetched == 6 and len([c for c in sess.calls if "robots" not in c]) == 6
+    assert report.fetched == 6 and len([c for c in sess.calls if not any(x in c for x in ("robots", "jina", "sitemap"))]) == 6
     assert report.warnings
 
 

@@ -5,5 +5,6 @@
       "maxDuration": 300,
       "excludeFiles": "{tests/**,docs/**,eval/results/**,design/**}"
     }
-  }
+  },
+  "fluid": true
 }

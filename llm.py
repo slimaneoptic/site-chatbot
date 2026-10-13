@@ -33,6 +33,8 @@ PRICES = {
     "google/gemini-3.1-flash-lite": (0.25, 1.50),
 }
 TRANSLATE_MODEL = "google/gemini-3.1-flash-lite"
+FIRST_TOKEN_S = 7.0  # a model that has written nothing after this long hands over to the next one (thinking spikes)
+DROPPED_THINK_TOKENS = 1000  # billed thinking a model dropped at FIRST_TOKEN_S is assumed to have done (estimate)
 INTERRUPTED = "\n\n(The answer was interrupted. Please ask again.)"
 
 
@@ -74,11 +76,50 @@ class LLMError(Exception):
 
 
 def api_key() -> str | None:
-    return os.environ.get("OPENROUTER_API_KEY") or os.environ.get("openrouter_key")
+    """The OpenRouter key without surrounding spaces, newlines or quotes (a pasted key often has them)."""
+    raw = os.environ.get("OPENROUTER_API_KEY") or os.environ.get("openrouter_key") or ""
+    key = raw.strip().strip("'\"").strip()
+    return key or None
+
+
+KEY_URL = "https://openrouter.ai/api/v1/key"
+_KEY_STATE = {"state": "unchecked", "key": None}  # "ok" | "rejected" | "unchecked", for the key it was measured on
+
+
+def key_state() -> str:
+    """"ok" | "missing" | "rejected" | "unchecked" for the current key."""
+    key = api_key()
+    if not key:
+        return "missing"
+    return _KEY_STATE["state"] if _KEY_STATE["key"] == key else "unchecked"
+
+
+def mark_key(state: str) -> None:
+    _KEY_STATE["state"], _KEY_STATE["key"] = state, api_key()
+
+
+def check_key(get=None, timeout: float = 5) -> str:
+    """Ask OpenRouter whether the key is valid (GET /api/v1/key). Sets and returns the key state; never raises."""
+    if not api_key():
+        return "missing"
+    try:
+        r = (get or requests.get)(KEY_URL, headers=_headers(), timeout=timeout)
+        if r.status_code == 200:
+            mark_key("ok")
+        elif r.status_code in (401, 403):
+            mark_key("rejected")
+    except Exception:  # noqa: BLE001 - unknown stays "unchecked"
+        pass
+    return key_state()
+
+
+def check_key_async(get=None) -> None:
+    import threading
+    threading.Thread(target=check_key, args=(get,), daemon=True, name="key-check").start()
 
 
 def available() -> bool:
-    return bool(api_key())
+    return bool(api_key()) and key_state() != "rejected"
 
 
 def reasoning(model: str) -> dict:
@@ -127,6 +168,7 @@ def complete_json(messages: list[dict], schema: dict, name: str = "result", time
             errors.append(f"{model}: {type(err).__name__}")
             continue
         if r.status_code == 401:
+            mark_key("rejected")
             raise LLMError("The OpenRouter API key was rejected.")
         if r.status_code in RETRYABLE:
             errors.append(f"{model}: {'no OpenRouter credits' if r.status_code == 402 else r.status_code}")
@@ -145,11 +187,14 @@ def stream_text(messages: list[dict], timeout: int = 90, *, max_tokens: int = 40
     """Yield answer text as it streams. Falls back to the next model if one fails before any text.
 
     `deadline_s` stops trying further models after that many seconds (raises LLMError).
-    `on_usage` is called once with the Usage of the model that answered, when the stream ends."""
+    `on_usage` is called once with the Usage of the model that answered, when the stream ends. A model dropped for
+    writing nothing after FIRST_TOKEN_S was still billed for its prompt and thinking: that estimate is added to the
+    usage (calls included), and when no model answers on_usage still gets it before LLMError is raised."""
     if not available():
         raise LLMError("No OpenRouter API key configured.")
     errors = []
     start = time.monotonic()
+    dropped = Usage()  # models given up on after FIRST_TOKEN_S (billed anyway)
     for model in models():
         wait = timeout
         if deadline_s is not None:
@@ -169,6 +214,7 @@ def stream_text(messages: list[dict], timeout: int = 90, *, max_tokens: int = 40
             continue
         if r.status_code == 401:
             r.close()
+            mark_key("rejected")
             raise LLMError("The OpenRouter API key was rejected.")
         if r.status_code != 200:
             errors.append(f"{model}: {'no OpenRouter credits' if r.status_code == 402 else r.status_code}")
@@ -178,8 +224,19 @@ def stream_text(messages: list[dict], timeout: int = 90, *, max_tokens: int = 40
         out: list[str] = []
         raw_usage = None
         r.encoding = "utf-8"
+        sent_at = time.monotonic()
+        has_next = model != models()[-1]
         try:
             for line in r.iter_lines(decode_unicode=True):
+                if not started and has_next and time.monotonic() - sent_at > FIRST_TOKEN_S:
+                    errors.append(f"{model}: no text after {FIRST_TOKEN_S:g} s")
+                    prompt = _chars_tokens("".join(str(m.get("content", "")) for m in messages))
+                    dropped.prompt_tokens += prompt
+                    dropped.completion_tokens += DROPPED_THINK_TOKENS
+                    dropped.cost_usd += estimate_cost(model, prompt, DROPPED_THINK_TOKENS)
+                    dropped.calls += 1
+                    dropped.model = dropped.model or model
+                    break
                 if not line or not line.startswith("data:"):
                     continue  # blank lines and ": keep-alive" comments
                 payload = line[5:].strip()
@@ -215,24 +272,58 @@ def stream_text(messages: list[dict], timeout: int = 90, *, max_tokens: int = 40
         finally:
             r.close()
             if started and on_usage is not None:
-                on_usage(_usage(model, raw_usage, messages, "".join(out)))
+                u = _usage(model, raw_usage, messages, "".join(out))
+                if dropped.calls:
+                    u = Usage(u.prompt_tokens + dropped.prompt_tokens, u.completion_tokens + dropped.completion_tokens,
+                              u.cost_usd + dropped.cost_usd, u.model, u.calls + dropped.calls)
+                on_usage(u)
         if started:
             return
+    if dropped.calls and on_usage is not None:
+        on_usage(dropped)
     raise _failure(errors)
+
+
+def quick_json(messages: list[dict], schema: dict, *, model: str = TRANSLATE_MODEL, max_tokens: int = 250,
+               timeout: float = 3, name: str = "result", post=None) -> tuple[dict, Usage]:
+    """One small structured call to a fast model, no fallback chain (for extras like starter questions).
+    Raises LLMError on any failure."""
+    if not available():
+        raise LLMError("No OpenRouter API key configured.")
+    body = {"model": model, "messages": messages, "max_tokens": max_tokens, "usage": {"include": True},
+            "response_format": {"type": "json_schema", "json_schema": {"name": name, "strict": True, "schema": schema}}}
+    try:
+        r = (post or requests.post)(URL, headers=_headers(), json=body, timeout=timeout)
+    except requests.RequestException as err:
+        raise LLMError(type(err).__name__) from err
+    if r.status_code == 401:
+        mark_key("rejected")
+    if r.status_code != 200:
+        raise LLMError(f"{model}: {r.status_code}")
+    try:
+        data = json.loads(r.text, strict=False)
+        content = data["choices"][0]["message"]["content"] or ""
+        out = json.loads(_clean_json(content), strict=False)
+    except (ValueError, KeyError, IndexError, TypeError) as err:
+        raise LLMError(f"{model}: unusable answer") from err
+    return out, _usage(model, data.get("usage"), messages, content)
 
 
 _LANG_NAMES = {"ar": "Arabic", "latin": "English", "en": "English", "fr": "French", "es": "Spanish", "de": "German",
                "it": "Italian", "pt": "Portuguese"}
 
 
-def translate_query(text: str, target_lang: str, *, on_usage: Callable[[Usage], None] | None = None, timeout: int = 10) -> str:
+def translate_query(text: str, target_lang: str, *, on_usage: Callable[[Usage], None] | None = None, timeout: int = 10,
+                    hint: str = "") -> str:
     """Translate a short search question into the site's language (Flash-Lite, max 80 tokens).
+    `hint`: words the site uses (titles, frequent words), preferred where they fit, so the search finds them.
     Returns `text` unchanged on any failure; never raises."""
     if not text.strip() or not available():
         return text
     lang = _LANG_NAMES.get(target_lang, target_lang)
     messages = [
-        {"role": "system", "content": f"Translate the user's search question into {lang}. Reply with the translation only, one line."},
+        {"role": "system", "content": f"Translate the user's search question into {lang}. Reply with the translation only, one line."
+                                      + (f" Where they fit the meaning, use the words this website uses: {hint[:900]}." if hint else "")},
         {"role": "user", "content": text[:500]},
     ]
     try:

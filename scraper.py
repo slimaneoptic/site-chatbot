@@ -9,16 +9,21 @@ the address actually connected to is checked with _public_ip(), and a private on
 from __future__ import annotations
 
 import hashlib
+import heapq
 import ipaddress
 import logging
+import os
 import re
 import socket
+import threading
 import time
-from collections import deque
+from collections import Counter, OrderedDict, deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from time import monotonic as _real_monotonic  # the renderer's rate limit uses real time even when a test fakes `time`
 from typing import Callable, Iterator
 from urllib import robotparser
-from urllib.parse import urldefrag, urljoin, urlparse, urlunparse
+from urllib.parse import unquote, urldefrag, urljoin, urlparse, urlunparse
 
 import lxml.html
 import requests
@@ -40,6 +45,24 @@ ROBOTS_MAX_BYTES = 500_000  # longer robots.txt files are cut here (RFC 9309 ask
 MIN_WORDS = 30              # a page with fewer words is "thin" and is not kept
 MAX_CRAWL_DELAY_S = 5       # robots.txt Crawl-delay is respected up to this
 REDIRECTS = (301, 302, 303, 307, 308)
+FETCH_WORKERS = 4           # pages fetched at the same time per host (1 when robots.txt asks for a Crawl-delay > DELAY_S)
+
+# JavaScript-site fallback: a page whose HTML has almost no text is read again through Jina Reader, which runs
+# the page in a browser and returns its text. Only public, in-scope, robots-allowed addresses are ever sent.
+JINA_URL = "https://r.jina.ai/"
+JINA_TIMEOUT_S = 20
+RENDER_BELOW_WORDS = 60     # render when the HTML text has fewer words and looks like a JS shell (or is the start page)
+JS_SOFT_PAGES = 6           # a JavaScript site stops at this many pages once the read has taken JS_SOFT_S
+JS_SOFT_S = 15
+SITEMAP_MAX_BYTES = 500_000
+SITEMAP_MAX_URLS = 50
+SITE_INFO_TITLE = "Contact details and site-wide info"
+SITE_INFO_MAX_WORDS = 400
+KEY_WORDS = ("contact", "pricing", "price", "plans", "tarif", "prix", "faq", "hours", "horaires", "locations",
+             "shipping", "livraison", "about", "اتصل", "تواصل", "الأسعار")
+ONE_HOP_MAX = 3             # same-host key pages outside the folder, linked from the start page
+_LOW_VALUE = re.compile(r"/_modules/|genindex|modindex|/search(?:\.html)?/?$|/(?:log-?in|sign-?in|sign-?up|register|cart|"
+                        r"checkout|account|settings|wp-json|feed)(?:/|$)|replytocom=", re.I)
 
 log = logging.getLogger(__name__)
 
@@ -61,6 +84,7 @@ class Page:
     url: str
     title: str
     text: str
+    rendered: bool = False  # read through the JavaScript page renderer
 
     @property
     def words(self) -> int:
@@ -95,9 +119,11 @@ class CrawlReport:
     start_url: str
     pages: list[Page]
     fetched: int
-    stopped: str            # "done" | "max_pages" | "max_fetches" | "time_limit"
+    stopped: str            # "done" | "max_pages" | "max_fetches" | "time_limit" | "js_time" (slow JS site, enough pages)
     js_only: bool
     warnings: list[str] = field(default_factory=list)
+    rendered: int = 0       # pages read through the JavaScript renderer
+    jina_calls: int = 0     # renderer requests made (0 for a plain server-rendered site)
 
 
 def normalize_url(url: str) -> str:
@@ -229,11 +255,12 @@ def _harden(session) -> None:
 
 
 def _download(session, url: str, *, max_redirects: int = 3, max_bytes: int | None = None, truncate: bool = False,
-              deadline: float | None = None, allow: Callable[[str], bool] | None = None):
+              deadline: float | None = None, allow: Callable[[str], bool] | None = None, timeout: float | None = None):
     """GET with every redirect hop re-checked. Returns (final_url, status, headers, body, encoding); raises CrawlError."""
     max_bytes = MAX_BYTES if max_bytes is None else max_bytes
     _harden(session)
-    stop_at = time.monotonic() + 3 * TIMEOUT_S
+    timeout = timeout or TIMEOUT_S
+    stop_at = time.monotonic() + 3 * timeout
     if deadline is not None:
         stop_at = min(stop_at, deadline)
     for _ in range(max_redirects + 1):
@@ -244,7 +271,7 @@ def _download(session, url: str, *, max_redirects: int = 3, max_bytes: int | Non
         if left <= 0:
             raise CrawlError("timeout")
         try:
-            resp = session.get(url, timeout=min(TIMEOUT_S, max(left, 0.5)), allow_redirects=False, stream=True)
+            resp = session.get(url, timeout=min(timeout, max(left, 0.5)), allow_redirects=False, stream=True)
         except requests.Timeout as err:
             raise CrawlError("timeout") from err
         except requests.RequestException as err:
@@ -319,7 +346,8 @@ def _scope(start_url: str) -> tuple[str, str]:
     return p.netloc, path
 
 
-def _links(html: str, base: str) -> list[str]:
+def _links(html: str, base: str, with_text: bool = False) -> list:
+    """Absolute <a href> links without #fragments or file downloads; (url, anchor text) pairs when with_text."""
     try:
         doc = lxml.html.fromstring(html)
     except (ValueError, lxml.etree.ParserError):
@@ -330,7 +358,14 @@ def _links(html: str, base: str) -> list[str]:
         if el.tag == "a" and attr == "href":
             link = urldefrag(link)[0]
             if not link.lower().split("?")[0].endswith(SKIP_EXT):
-                out.append(link)
+                if with_text:
+                    try:
+                        anchor = " ".join(el.text_content().split())[:80]
+                    except Exception:  # noqa: BLE001
+                        anchor = ""
+                    out.append((link, anchor))
+                else:
+                    out.append(link)
     return out
 
 
@@ -372,7 +407,12 @@ def _extract(html: str, url: str) -> tuple[str, str]:
         log.warning("text extraction failed for %s", url, exc_info=True)
         return "", ""
     text = strip_inline_html((data.get("text") or "").replace("¶", "")).strip()
-    return (data.get("title") or "").strip(), text
+    return clean_title(data.get("title") or ""), text
+
+
+def clean_title(title: str) -> str:
+    """Page title without Sphinx/MkDocs pilcrows and extra whitespace."""
+    return re.sub(r"\s+", " ", (title or "").replace("¶", "")).strip()
 
 
 # Colour markup that docs keep as text inside terminal blocks (FastAPI: <font color="#4E9A06">fastapi</font>).
@@ -410,6 +450,199 @@ def _load_robots(session, scheme: str, host: str, deadline: float) -> robotparse
     return robots
 
 
+# ---------------------------------------------------------------- JavaScript page renderer (Jina Reader)
+
+class _Bucket:
+    """Per-instance token bucket: at most `rpm` renderer calls per minute (Jina's free limit is 20/min)."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._tokens: float | None = None
+        self._at = 0.0
+
+    def take(self, rpm: int) -> bool:
+        with self._lock:
+            now = _real_monotonic()
+            if self._tokens is None:
+                self._tokens, self._at = float(rpm), now
+            self._tokens = min(float(rpm), self._tokens + (now - self._at) * rpm / 60.0)
+            self._at = now
+            if self._tokens >= 1:
+                self._tokens -= 1
+                return True
+            return False
+
+
+_JINA_BUCKET = _Bucket()
+JINA_TOTAL = {"calls": 0}  # renderer calls made by this process (logged; 0 for server-rendered sites)
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except ValueError:
+        return default
+
+
+# Bounded on purpose: unbounded [^\]]* / \S+? retry from every "[" and take seconds on a hostile 40 KB line.
+_MD_IMG = re.compile(r"!\[[^\]\n]{0,300}\]\([^)\n]{0,2048}\)")
+_MD_LINK = re.compile(r"\[([^\]\n]{0,300})\]\(([^)\s\[]{1,2048})(?:\s+\"[^\"\n]{0,200}\")?\)")
+MD_MAX_LINE = 20_000        # longer markdown lines are dropped (no real page text line is that long)
+JINA_MAX_BYTES = 300_000    # renderer answers are cut here
+
+
+def parse_jina(body: str) -> tuple[str, str, str]:
+    """Jina Reader's text answer -> (title, url source, markdown content)."""
+    head, sep, rest = (body or "").partition("Markdown Content:")
+    title = source = ""
+    for line in head.splitlines():
+        if line.startswith("Title:"):
+            title = line[6:].strip()
+        elif line.startswith("URL Source:"):
+            source = line[11:].strip()
+    return clean_title(title), source, (rest if sep else body or "").strip()
+
+
+def markdown_text(md: str) -> str:
+    """Markdown -> plain text: image lines dropped, link text kept, **, __ and # marks removed."""
+    lines = []
+    for line in (md or "").splitlines():
+        if len(line) > MD_MAX_LINE:
+            continue
+        line = _MD_IMG.sub("", line)
+        line = _MD_LINK.sub(lambda m: m.group(1), line)
+        line = re.sub(r"^\s{0,3}#{1,6}\s*", "", line)
+        line = line.replace("**", "").replace("__", "")
+        if re.fullmatch(r"\s*(=+|-{3,}|\*{3,})\s*", line):
+            line = ""
+        lines.append(line.rstrip())
+    text = "\n".join(lines)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+def markdown_links(md: str, base: str) -> list[tuple[str, str]]:
+    """[text](url) links of the markdown as absolute (url, text), images and file downloads left out."""
+    out = []
+    for line in (md or "").splitlines():
+        if len(line) > MD_MAX_LINE:
+            continue
+        for m in _MD_LINK.finditer(_MD_IMG.sub("", line)):
+            link = urldefrag(urljoin(base, m.group(2).strip("<>")))[0]
+            if urlparse(link).scheme in ("http", "https") and not link.lower().split("?")[0].endswith(SKIP_EXT):
+                out.append((link, " ".join(m.group(1).split())[:80]))
+    return out
+
+
+def _same_site(a: str, b: str) -> bool:
+    strip = lambda h: (h or "").lower().removeprefix("www.")  # noqa: E731
+    return strip(urlparse(a).netloc) == strip(urlparse(b).netloc)
+
+
+# ---------------------------------------------------------------- site-wide info (footer, sidebar, tel:/mailto:)
+
+_INFO_BLOCK = re.compile(r"foot|sidebar|side-bar|widget|contact|address|hours|horaire|tags", re.I)
+
+
+def _site_info_lines(html: str) -> list[str]:
+    """Short lines of the footer / sidebar blocks plus tel: and mailto: links (the parts a main-text reader drops)."""
+    try:
+        doc = lxml.html.fromstring(html)
+    except Exception:  # noqa: BLE001
+        return []
+    out: list[str] = []
+    for el in doc.xpath("//a[starts-with(@href,'tel:') or starts-with(@href,'mailto:')]"):
+        href = el.get("href", "")
+        label = " ".join(el.text_content().split())
+        kind = "Phone" if href.startswith("tel:") else "Email"
+        value = unquote(href.split(":", 1)[1].split("?")[0]).strip()
+        if value:
+            out.append(f"{kind}: {value}" + (f" ({label})" if label and label != value else ""))
+    blocks = doc.xpath("//footer|//aside|//*[@role='contentinfo' or @role='complementary']")
+    for el in doc.xpath("//*[@class or @id]"):
+        if el.tag in ("div", "section", "ul", "address", "p") and _INFO_BLOCK.search(f"{el.get('class', '')} {el.get('id', '')}"):
+            blocks.append(el)
+    for el in blocks:
+        for bad in el.xpath(".//script|.//style|.//noscript"):
+            bad.drop_tree()
+        text = el.text_content()
+        if len(text.split()) > 200:  # a whole content column, not a footer
+            continue
+        for line in text.splitlines():  # not re.split(r"\s*\n\s*"): quadratic on a long run of spaces
+            line = " ".join(line.split())
+            if line and len(line) <= 200:
+                out.append(line)
+    return out
+
+
+# ---------------------------------------------------------------- crawl
+
+def _start_folder(start_url: str) -> str:
+    path = urlparse(start_url).path or "/"
+    if path.endswith("/"):
+        return path
+    last = path.rsplit("/", 1)[-1]
+    return path + "/" if "." not in last else path.rsplit("/", 1)[0] + "/"
+
+
+_ABOUT_PAGES = {"about", "about-us", "aboutus", "a-propos", "qui-sommes-nous", "من-نحن"}
+
+
+def _is_key(url: str, anchor: str = "") -> bool:
+    """Contact, pricing, FAQ, hours, locations, shipping or about-us page, by its address or a short link text.
+    "about" counts only for the about page itself ("About Git" in a docs menu is not a key page)."""
+    path = unquote(urlparse(url).path).lower()
+    tokens = [t for t in re.split(r"[/\-_.]+", path) if t]
+    anchor = " ".join((anchor or "").lower().split())
+    short = anchor if len(anchor.split()) <= 3 else ""
+    for w in KEY_WORDS:
+        if w == "about":
+            last = re.sub(r"\.(html?|php|aspx?)$", "", path.rstrip("/").rsplit("/", 1)[-1])
+            if last in _ABOUT_PAGES or short in ("about", "about us"):
+                return True
+        elif any(t.startswith(w) for t in tokens) or w in path or (short and w in short):
+            return True
+    return False
+
+
+def _slug(url: str) -> tuple[str, ...]:
+    last = unquote(urlparse(url).path).rstrip("/").rsplit("/", 1)[-1].lower()
+    last = re.sub(r"\.(html?|php|aspx?)$", "", last)
+    return tuple(t[:-1] if len(t) > 3 and t.endswith("s") else t for t in re.split(r"[-_.]+", last) if t)
+
+
+# Translated copies of a site (/de/, /pt-br/, /zh-hant/...) fill a read with the same pages in other languages.
+_LANG_CODES = frozenset(
+    "ar az bg bn ca cs da de el en es et fa fi fil fr he hi hr hu id it ja ko lt lv ms nb nl nn pl pt ro ru sk sl sr sv "
+    "th tr uk ur vi yo zh".split())
+_LANG_SEG = re.compile(r"([a-z]{2,3})(?:[-_](?:[a-z]{2}|[a-z]{4}|\d{3}))?", re.I)
+_HTML_LANG = re.compile(r"""<html\b[^>]{0,500}?\blang=["']?([A-Za-z]{2,3})(?:[-_][A-Za-z0-9]{2,8})?""", re.I)
+_LINK_TAG = re.compile(r"<link\b[^>]{0,800}>", re.I)
+_ATTR = re.compile(r"""\b(rel|hreflang|href)\s*=\s*(?:"([^"]{0,2048})"|'([^']{0,2048})'|([^\s>]{1,2048}))""", re.I)
+
+
+def _path_lang(url: str) -> str:
+    """Language code of the address's first path segment ("de" for /de/about/, "pt" for /pt-br/), else ""."""
+    seg = urlparse(url).path.lstrip("/").split("/", 1)[0]
+    m = _LANG_SEG.fullmatch(seg)
+    code = m.group(1).lower() if m else ""
+    return code if code in _LANG_CODES else ""
+
+
+def _lang_info(html: str, base: str) -> tuple[str, list[tuple[str, str]]]:
+    """(<html lang> primary subtag, [(hreflang, absolute url)] of <link rel=alternate hreflang>), from the head."""
+    head = html[:200_000]
+    m = _HTML_LANG.search(head)
+    lang = m.group(1).lower() if m else ""
+    alts = []
+    for tag in _LINK_TAG.findall(head):
+        attrs = {a.group(1).lower(): a.group(2) or a.group(3) or a.group(4) or "" for a in _ATTR.finditer(tag)}
+        if "alternate" in attrs.get("rel", "").lower().split() and attrs.get("hreflang") and attrs.get("href"):
+            alts.append((attrs["hreflang"].lower(), urldefrag(urljoin(base, attrs["href"].strip()))[0]))
+        if len(alts) >= 100:
+            break
+    return lang, alts
+
+
 class _Run:
     def __init__(self):
         self.start_url = ""
@@ -418,6 +651,220 @@ class _Run:
         self.start_js = False
         self.js_pages = 0
         self.robots_skipped = 0
+        self.rendered = 0
+        self.jina_calls = 0
+        self.jina_stop = ""      # why rendering stopped for this read ("busy" | "failed"), "" while it may go on
+        self.closed = False      # the read is over (finished, failed or abandoned): workers still running stop early
+        self.info: OrderedDict[str, None] = OrderedDict()
+        self.lock = threading.Lock()
+
+
+@dataclass
+class _Got:
+    url: str            # asked
+    final: str = ""
+    title: str = ""
+    text: str = ""
+    rendered: bool = False
+    links: list = field(default_factory=list)  # [(url, anchor)]
+    js_like: bool = False
+    needed_render: bool = False
+    info: list = field(default_factory=list)
+    error: CrawlError | None = None
+    lang: str = ""      # <html lang>, primary subtag ("en", "fr")
+    alternates: list = field(default_factory=list)  # [(hreflang, url)] from <link rel="alternate" hreflang>
+
+
+class _Renderer:
+    """Reads one page through Jina Reader within this read's limits (JS_MAX_PAGES, JINA_RPM, stop on 429/5xx)."""
+
+    def __init__(self, run: _Run, deadline: float):
+        self.run, self.deadline = run, deadline
+        self.max_pages = max(0, _env_int("JS_MAX_PAGES", 8))
+        self.rpm = max(1, _env_int("JINA_RPM", 20))
+        # both sessions made here, not lazily: a worker still running after close() must not open a new one
+        self._session, self._fresh = self._new_session(False), self._new_session(True)
+
+    @staticmethod
+    def _new_session(fresh: bool):
+        sess = requests.Session()
+        sess.headers["User-Agent"] = USER_AGENT
+        sess.headers["X-Retain-Images"] = "none"
+        if fresh:  # skip Jina's cache: a cached copy can predate the page's scripts
+            sess.headers["X-No-Cache"] = "true"
+        key = os.environ.get("JINA_API_KEY", "").strip().strip("'\"")
+        if key:
+            sess.headers["Authorization"] = f"Bearer {key}"
+        return sess
+
+    def _sess(self, fresh: bool = False):
+        return self._fresh if fresh else self._session
+
+    def close(self):
+        for attr in ("_session", "_fresh"):
+            sess = getattr(self, attr, None)
+            if sess is not None:
+                sess.close()
+
+    def _get(self, url: str, fresh: bool) -> tuple[int | None, bytes]:
+        """(status, body) of one renderer call; status None when the renderer timed out or was unreachable."""
+        if fresh:
+            with self.run.lock:
+                self.run.jina_calls += 1
+                JINA_TOTAL["calls"] += 1
+        try:
+            _, status, _, body, _ = _download(self._sess(fresh), JINA_URL + url, max_redirects=0, deadline=self.deadline,
+                                              timeout=JINA_TIMEOUT_S, max_bytes=JINA_MAX_BYTES, truncate=True)
+            return status, body
+        except CrawlError as err:
+            return (None if err.code in ("timeout", "unreachable") else 0), b""
+
+    def render(self, url: str) -> tuple[str, str, list] | None:
+        """(title, text, links) of the rendered page, or None. The caller already checked scope and robots."""
+        run = self.run
+        with run.lock:  # jina_calls: thin pages asked twice (cached, then fresh) must not run past 2 x the page cap
+            if run.closed or run.jina_stop or run.rendered >= self.max_pages or run.jina_calls >= 2 * self.max_pages:
+                return None
+        try:
+            check_public_url(url)  # never send an internal address to the renderer
+        except CrawlError:
+            return None
+        if not _JINA_BUCKET.take(self.rpm):
+            with run.lock:
+                run.jina_stop = run.jina_stop or "busy"
+            return None
+        with run.lock:
+            run.jina_calls += 1
+            JINA_TOTAL["calls"] += 1
+        log.info("page renderer: %s", url)
+        t0 = _real_monotonic()
+        status, body = self._get(url, fresh=False)
+        if status == 200 and len(markdown_text(parse_jina(_decode(body, "utf-8"))[2]).split()) < RENDER_BELOW_WORDS:
+            if _JINA_BUCKET.take(self.rpm):  # thin: often a stale copy taken before the page's scripts ran: ask fresh
+                status, body = self._get(url, fresh=True)
+        log.info("page renderer: %s -> %s in %.1f s", url, status, _real_monotonic() - t0)
+        if status is None or status == 429 or status >= 500:
+            with run.lock:
+                run.jina_stop = run.jina_stop or "failed"
+            return None
+        if status != 200:
+            return None
+        title, source, md = parse_jina(_decode(body, "utf-8"))
+        if source and not _same_site(source, url):
+            return None
+        text = markdown_text(md)
+        if len(text.split()) < MIN_WORDS:
+            return None
+        with run.lock:
+            if run.rendered >= self.max_pages:
+                return None
+            run.rendered += 1
+        return title, text, markdown_links(md, source or url)
+
+
+def _fetch_one(session, renderer: _Renderer, url: str, *, first: bool, via_render: bool, deadline: float,
+               allow: Callable[[str], bool] | None, in_scope: Callable[[str], bool] | None = None,
+               js_site: bool = False, render_ok: Callable[[str], bool] | None = None, defer_render: bool = False) -> _Got:
+    """Fetch and read one page (in a worker thread). Network problems come back in `error`; bugs raise.
+    `render_ok(final)` must pass before the page goes to the renderer (default: `allow`); `defer_render` leaves
+    that to the caller (the start page: its robots check and the first renderer calls come later, in parallel)."""
+    got = _Got(url)
+    if renderer.run.closed:  # the read ended while this fetch waited in the pool
+        got.error = CrawlError("timeout")
+        return got
+    if via_render:  # a JavaScript site: its HTML is an empty shell, go straight to the renderer
+        r = renderer.render(url)
+        if r is not None:
+            got.final, (got.title, got.text, got.links), got.rendered = url, r, True
+            return got
+    try:
+        got.final, html = _fetch_html(session, url, deadline=deadline, allow=allow)
+    except CrawlError as err:
+        got.error = err
+        return got
+    got.title, got.text = _extract(html, got.final)
+    got.links = _links(html, got.final, True)
+    got.info = _site_info_lines(html)
+    got.lang, got.alternates = _lang_info(html, got.final)
+    words = len(got.text.split())
+    got.js_like = words < MIN_WORDS and looks_js_only(html, got.text)
+    few_links = first and in_scope is not None and sum(1 for u, _ in got.links if in_scope(u)) < 3
+    got.needed_render = words < RENDER_BELOW_WORDS and (got.js_like or (first and (in_scope is None or few_links)))
+    if got.needed_render and (first or js_site) and not defer_render:  # a server-rendered site's odd app page is skipped
+        ok = render_ok or allow
+        if ok is None or ok(got.final):
+            _render_into(renderer, got)
+    return got
+
+
+def _render_into(renderer: _Renderer, got: _Got) -> _Got:
+    """Replace the page's text with the renderer's when that has more words (links are added)."""
+    words = len(got.text.split())
+    r = renderer.render(got.final)
+    if r is not None and len(r[1].split()) > words:
+        (title, got.text, extra), got.rendered = r, True
+        got.title = title or got.title
+        got.links = got.links + extra
+    return got
+
+
+class _Done:
+    def __init__(self, value):
+        self.value = value
+
+    def result(self):
+        return self.value
+
+
+# Bounded patterns, blocks cut with str.split: lazy (.*?) up to a closing tag that never comes is quadratic.
+_SM_LOC = re.compile(r"<loc>\s*([^<\s][^<]{0,2047})</loc>")
+_SM_PRI = re.compile(r"<priority>\s*([\d.]{1,10})\s*</priority>")
+SITEMAP_MAX_BLOCKS = 200    # <url> entries read per sitemap
+
+
+def _sitemap_urls(session, scheme: str, host: str, robots, deadline: float) -> list[tuple[str, float]]:
+    """(url, priority) from /sitemap.xml and robots.txt Sitemap: lines (same host, one sitemap-index level)."""
+    todo = [f"{scheme}://{host}/sitemap.xml"]
+    for sm in (robots.site_maps() or []):
+        if urlparse(sm).netloc.lower() == host and sm not in todo:
+            todo.insert(0, sm)
+    out: list[tuple[str, float]] = []
+    seen_maps: set[str] = set()
+    while todo and len(seen_maps) < 4 and time.monotonic() < deadline:
+        sm = todo.pop(0)
+        if sm in seen_maps:
+            continue
+        seen_maps.add(sm)
+        try:
+            final, status, _, body, _ = _download(session, sm, max_redirects=2, max_bytes=SITEMAP_MAX_BYTES, truncate=True,
+                                                  deadline=deadline)
+        except CrawlError:
+            continue
+        if status != 200 or urlparse(final).netloc.lower().removeprefix("www.") != host.removeprefix("www."):
+            continue
+        xml = _decode(body, "utf-8")
+        if "<sitemapindex" in xml:
+            n = 0
+            for m in _SM_LOC.finditer(xml):
+                loc = m.group(1).strip()
+                if urlparse(loc).netloc.lower() == host:
+                    todo.append(loc.replace("&amp;", "&"))
+                n += 1
+                if n >= 3:
+                    break
+            continue
+        for block in xml.split("<url>", SITEMAP_MAX_BLOCKS + 1)[1:SITEMAP_MAX_BLOCKS + 1]:
+            block = block.split("</url>", 1)[0]
+            loc = _SM_LOC.search(block)
+            if not loc:
+                continue
+            pri = _SM_PRI.search(block)
+            try:
+                p = float(pri.group(1)) if pri else 0.5
+            except ValueError:
+                p = 0.5
+            out.append((loc.group(1).replace("&amp;", "&").strip(), p))
+    return out
 
 
 def _crawl(start_url: str, max_pages: int, on_page, max_seconds: float, run: _Run) -> Iterator[Page]:
@@ -427,79 +874,264 @@ def _crawl(start_url: str, max_pages: int, on_page, max_seconds: float, run: _Ru
     if max_pages <= 0:
         run.stopped = "max_pages"
         return
-    deadline = time.monotonic() + max_seconds
+    started = time.monotonic()
+    deadline = started + max_seconds
     max_fetches = max_pages * MAX_FETCHES_FACTOR
     session = requests.Session()
     session.headers["User-Agent"] = USER_AGENT
+    renderer = _Renderer(run, deadline)
+    pool = None
     try:
         scheme = urlparse(start_url).scheme
         host, prefix = _scope(start_url)
         robots = _load_robots(session, scheme, host, deadline)
         if not robots.can_fetch(USER_AGENT, start_url):
             raise CrawlError("robots")
-        delay = max(DELAY_S, min(float(robots.crawl_delay(USER_AGENT) or 0), MAX_CRAWL_DELAY_S))
+        crawl_delay = float(robots.crawl_delay(USER_AGENT) or 0)
+        delay = max(DELAY_S, min(crawl_delay, MAX_CRAWL_DELAY_S))
+        workers = 1 if crawl_delay > max(DELAY_S, 0.5) else max(1, FETCH_WORKERS)
+        sc = {"host": host, "prefix": prefix, "folder": _start_folder(start_url), "robots": robots}
+        one_hop: set[str] = set()
+
+        def in_scope(u: str) -> bool:
+            p = urlparse(u)
+            return p.scheme in ("http", "https") and p.netloc.lower() == sc["host"] and \
+                (p.path.startswith(sc["prefix"]) or u in one_hop)
 
         def allowed(u: str) -> bool:
-            p = urlparse(u)
-            return p.scheme in ("http", "https") and p.netloc.lower() == host and p.path.startswith(prefix) and robots.can_fetch(USER_AGENT, u)
+            return in_scope(u) and sc["robots"].can_fetch(USER_AGENT, u)
 
-        queue, seen, kept, texts, done, first = deque([start_url]), {start_url}, set(), set(), 0, True
-        while queue:
-            if done >= max_pages:
-                run.stopped = "max_pages"
-                break
-            if run.fetched >= max_fetches:
-                run.stopped = "max_fetches"
-                break
-            if not first:
-                time.sleep(max(0.0, min(delay, deadline - time.monotonic())))
-            if time.monotonic() >= deadline:
-                run.stopped = "time_limit"
-                break
-            url = queue.popleft()
-            if not first and not allowed(url):
-                run.robots_skipped += 1
-                continue
-            run.fetched += 1
-            try:
-                final, html = _fetch_html(session, url, deadline=deadline, allow=None if first else allowed)
-            except CrawlError:
-                if first:
-                    raise
-                continue
-            if first and _scope(final) != (host, prefix):  # the start page moved (e.g. to www.): follow it
-                if urlparse(final).netloc != host:
-                    robots = _load_robots(session, urlparse(final).scheme, urlparse(final).netloc, deadline)
-                host, prefix = _scope(final)
-                host = host.lower()
-                if not robots.can_fetch(USER_AGENT, final):
-                    raise CrawlError("robots")
-            seen.add(final)
-            title, text = _extract(html, final)
-            digest = hashlib.sha1(text.encode()).hexdigest()
-            if len(text.split()) >= MIN_WORDS and final not in kept and digest not in texts:
-                kept.add(final)
+        heap: list = []
+        seq = [0]
+        slugs: set[tuple] = set()
+        seen: set[str] = {start_url}
+        js_site = [False]
+        lang = {"code": "", "seg": "", "alts": set()}  # start page language, its first path segment, other-language copies
+
+        def other_lang(link: str) -> bool:
+            """A translated copy: another language's /xx/ folder, or an hreflang alternate in another language."""
+            if link in lang["alts"]:
+                return True
+            code = _path_lang(link)
+            if not code or not lang["code"] or code == lang["code"]:
+                return False
+            return urlparse(link).path.lstrip("/").split("/", 1)[0].lower() != lang["seg"]
+
+        def note_alternates(g: _Got) -> None:
+            for hl, alt in g.alternates:
+                code = hl.split("-", 1)[0]
+                if lang["code"] and code not in (lang["code"], "x") and alt != g.final and alt != run.start_url:
+                    lang["alts"].add(alt)
+
+        def push(link: str, anchor: str = "", via: bool = False, band_hint: int | None = None) -> None:
+            path = urlparse(link).path
+            under = (path if path.endswith("/") else path + "/").startswith(sc["folder"])
+            key = _is_key(link, anchor)
+            band = (0 if key else 1) if under else (2 if key else 3)
+            if _LOW_VALUE.search(link):
+                band = 4
+            if band_hint is not None:
+                band = min(band, band_hint)
+            slug = _slug(link)
+            refine = int(not key and any(slug[:n] in slugs for n in range(1, len(slug))))
+            slugs.add(slug)
+            seq[0] += 1
+            heapq.heappush(heap, (band, refine, seq[0], link, via))
+
+        def queue_links(links, final: str, first: bool) -> int:
+            n = 0
+            for link, anchor in links:
+                if link in seen:
+                    continue
+                p = urlparse(link)
+                if p.netloc.lower() != sc["host"] or p.scheme not in ("http", "https"):
+                    continue
+                if other_lang(link):
+                    seen.add(link)
+                    continue
+                if not p.path.startswith(sc["prefix"]):
+                    if not (first and len(one_hop) < ONE_HOP_MAX and _is_key(link, anchor)):
+                        continue
+                    one_hop.add(link)
+                seen.add(link)
+                push(link, anchor, via=js_site[0])
+                n += sc["robots"].can_fetch(USER_AGENT, link)
+            return n
+
+        # ---- the start page (its renderer call waits until the robots check of where it landed)
+        run.fetched += 1
+        got = _fetch_one(session, renderer, start_url, first=True, via_render=False, deadline=deadline, allow=None,
+                         in_scope=lambda u: urlparse(u).netloc.lower().removeprefix("www.") == sc["host"].removeprefix("www."),
+                         defer_render=True)
+        if got.error is not None:
+            raise got.error
+        final = got.final
+        if _scope(final) != (sc["host"], sc["prefix"]):  # the start page moved (e.g. to www.): follow it
+            if urlparse(final).netloc != sc["host"]:
+                sc["robots"] = _load_robots(session, urlparse(final).scheme, urlparse(final).netloc, deadline)
+            sc["host"], sc["prefix"] = _scope(final)
+            sc["host"] = sc["host"].lower()
+            sc["folder"] = _start_folder(final)
+        if not sc["robots"].can_fetch(USER_AGENT, final):  # also before the renderer reads it
+            raise CrawlError("robots")
+        seen.add(final)
+        lang["code"] = got.lang or _path_lang(final)
+        lang["seg"] = urlparse(final).path.lstrip("/").split("/", 1)[0].lower()
+        note_alternates(got)
+        run.start_js = js_site[0] = got.js_like
+        kept, texts, done = set(), set(), 0
+
+        def accept(g: _Got) -> Page | None:
+            nonlocal done
+            for line in g.info:
+                if len(run.info) < 400:
+                    run.info.setdefault(line)
+            if len(g.text.split()) < MIN_WORDS and g.info and _is_key(g.final):  # a contact form page: keep its details
+                extra = list(dict.fromkeys(x for x in g.info if x not in g.text))
+                g.text = (g.text + "\n" + "\n".join(extra)).strip()
+            digest = hashlib.sha1(g.text.encode()).hexdigest()
+            if len(g.text.split()) >= MIN_WORDS and g.final not in kept and digest not in texts:
+                kept.add(g.final)
                 texts.add(digest)
                 done += 1
                 if on_page:
                     try:
-                        on_page(done, final)
+                        on_page(done, g.final)
                     except Exception as err:  # the caller's own error: pass it through untouched
                         raise _CallerError(err) from err
-                yield Page(final, title or final, text)
-            elif len(text.split()) < MIN_WORDS and looks_js_only(html, text):
+                return Page(g.final, g.title or g.final, g.text, g.rendered)
+            if len(g.text.split()) < MIN_WORDS and g.js_like:
                 run.js_pages += 1
-                run.start_js = run.start_js or first
-            for link in _links(html, final):
-                p = urlparse(link)
-                if p.netloc.lower() == host and p.path.startswith(prefix) and link not in seen:
+            return None
+
+        queued = queue_links(got.links, final, True)
+        if got.needed_render or queued < 3:
+            for link, pri in sorted(_sitemap_urls(session, urlparse(final).scheme, sc["host"], sc["robots"], deadline),
+                                    key=lambda x: (not _is_key(x[0]), -x[1]))[:SITEMAP_MAX_URLS]:
+                link = urldefrag(link)[0]
+                if link not in seen and in_scope(link) and not link.lower().split("?")[0].endswith(SKIP_EXT) \
+                        and not other_lang(link):
                     seen.add(link)
-                    queue.append(link)
-            first = False
+                    push(link, via=js_site[0], band_hint=None)
+
+        if workers > 1:
+            pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="crawl")
+        inflight: deque = deque()
+        if got.needed_render:  # rendered while the first other pages are read (same pool, same rate limit)
+            inflight.append(pool.submit(_render_into, renderer, got) if pool is not None else _Done(_render_into(renderer, got)))
+        else:
+            inflight.append(_Done(got))
+        start_got = got
+        first_seq = True
+
+        def js_enough() -> bool:  # a slow JavaScript site: six pages are enough once the read passes JS_SOFT_S
+            return js_site[0] and done >= JS_SOFT_PAGES and time.monotonic() - started >= JS_SOFT_S
+
+        while True:
+            if done >= max_pages:
+                run.stopped = "max_pages"
+                break
+            if js_enough():
+                run.stopped = "js_time"
+                break
+            while heap and len(inflight) < workers and run.fetched < max_fetches and not js_enough():
+                if workers == 1 and not first_seq:
+                    time.sleep(max(0.0, min(delay, deadline - time.monotonic())))
+                if time.monotonic() >= deadline:
+                    break
+                _, _, _, url, via = heapq.heappop(heap)
+                if url in lang["alts"]:  # learned to be a translated copy after it was queued
+                    continue
+                if not allowed(url):
+                    run.robots_skipped += 1
+                    continue
+                first_seq = False
+                run.fetched += 1
+                if pool is None:
+                    inflight.append(_Done(_fetch_one(session, renderer, url, first=False, via_render=via,
+                                                     deadline=deadline, allow=allowed, js_site=js_site[0])))
+                    break  # one at a time: process it before the next fetch
+                inflight.append(pool.submit(_fetch_one, session, renderer, url, first=False, via_render=via,
+                                            deadline=deadline, allow=allowed, js_site=js_site[0]))
+            if not inflight:
+                if heap and run.fetched >= max_fetches:
+                    run.stopped = "max_fetches"
+                elif heap and time.monotonic() >= deadline:
+                    run.stopped = "time_limit"
+                break
+            g = inflight.popleft().result()
+            if g.error is not None:
+                continue
+            seen.add(g.final)
+            is_start = g is start_got
+            if not is_start:
+                note_alternates(g)
+            page = accept(g)
+            queue_links(g.links, g.final, is_start)
+            if page is not None:
+                yield page
+        if run.stopped == "done" and heap and run.fetched >= max_fetches:
+            run.stopped = "max_fetches"
     finally:
+        run.closed = True
+        if pool is not None:
+            pool.shutdown(wait=False, cancel_futures=True)
+        renderer.close()
         session.close()
 
 
+def _site_info_page(run: _Run, pages: list[Page], start_url: str) -> Page | None:
+    """One extra page with the footer/sidebar lines and phone/email links seen on the site (deduplicated)."""
+    if not pages or not run.info:
+        return None
+    lines, words = [], 0
+    joined = "\n".join(p.text for p in pages)
+    for line in run.info:
+        if line in joined and not line.startswith(("Phone:", "Email:")):
+            continue  # already in a page's main text
+        n = len(line.split())
+        if words + n > SITE_INFO_MAX_WORDS:
+            break
+        lines.append(line)
+        words += n
+    if words < 8:
+        return None
+    return Page(urldefrag(pages[0].url)[0] + "#site-info", SITE_INFO_TITLE, "\n".join(lines))
+
+
+_TITLE_SEP = re.compile(r"\s+[|—–\-·:]\s+")
+
+
+def clean_titles(pages: list[Page]) -> None:
+    """Strip pilcrows and a ' | Brand' / ' — Brand' suffix that most page titles repeat (in place)."""
+    for p in pages:
+        p.title = clean_title(p.title)
+    counts = Counter(p.title for p in pages)
+    seen_titles: set[str] = set()
+    for p in pages:  # a JavaScript app often gives every page the home page's title: name the others by their address
+        if counts[p.title] > 1 and p.title in seen_titles:
+            slug = unquote(urlparse(p.url).path).rstrip("/").rsplit("/", 1)[-1]
+            slug = re.sub(r"\.(html?|php|aspx?)$", "", slug).replace("-", " ").replace("_", " ").strip()
+            if slug:
+                p.title = slug[:1].upper() + slug[1:]
+        seen_titles.add(p.title)
+    if len(pages) < 3:
+        return
+    tails = Counter()
+    for p in pages:
+        parts = _TITLE_SEP.split(p.title)
+        if len(parts) > 1:
+            tails[parts[-1].strip()] += 1
+    if not tails:
+        return
+    tail, n = tails.most_common(1)[0]
+    if n * 2 <= len(pages) or n < 3:
+        return
+    pat = re.compile(r"\s+[|—–\-·:]\s+" + re.escape(tail) + r"$")
+    for p in pages:
+        short = pat.sub("", p.title).strip()
+        if short and short != p.title:
+            p.title = short
 class _CallerError(Exception):
     def __init__(self, err: Exception):
         super().__init__(str(err))
@@ -533,19 +1165,34 @@ def crawl(start_url: str, max_pages: int = 15, on_page: Callable[[int, str], Non
 
 
 def read_site(url: str, max_pages: int = 15, on_page: Callable[[int, str], None] | None = None, *,
-              max_seconds: float = MAX_SECONDS) -> CrawlReport:
+              max_seconds: float = MAX_SECONDS, on_kept: Callable[[Page], None] | None = None) -> CrawlReport:
     """Crawl and report. Raises only CrawlError (bad/unsafe address, or the start page can't be read).
     A site that answers but has no readable text returns a report with pages=[] and js_only/warnings set."""
     run = _Run()
-    pages = list(_guarded(_crawl(url, max_pages, on_page, max_seconds, run)))
+    pages = []
+    try:
+        for p in _guarded(_crawl(url, max_pages, on_page, max_seconds, run)):
+            pages.append(p)
+            if on_kept is not None:
+                try:
+                    on_kept(p)
+                except Exception:  # noqa: BLE001 - an observer must not break the read
+                    log.warning("on_kept failed", exc_info=True)
+    finally:
+        run.closed = True  # renderer calls still queued in worker threads give up
+    clean_titles(pages)
     js_only = run.start_js or (not pages and run.js_pages > 0)
     warnings = []
-    if js_only and not pages:
-        warnings.append(MESSAGES["js_only"])
+    if not pages:
+        warnings.append(MESSAGES["js_only"] if js_only else MESSAGES["no_text"])
+    elif run.rendered:
+        n = run.rendered
+        warnings.append(f"{n} page{'s' * (n != 1)} here {'are' if n != 1 else 'is'} drawn with JavaScript; "
+                        f"{'they were' if n != 1 else 'it was'} read through a page renderer.")
     elif js_only:
         warnings.append("Some pages here are drawn with JavaScript and were skipped. Client versions use a real browser for those.")
-    elif not pages:
-        warnings.append(MESSAGES["no_text"])
+    if pages and run.jina_stop and (run.js_pages or run.start_js):
+        warnings.append("The page renderer is busy right now, so some JavaScript pages were skipped.")
     if run.stopped == "time_limit":
         warnings.append(f"Stopped after {max_seconds:g} seconds (demo time limit); read {len(pages)} page{'s' * (len(pages) != 1)}.")
     elif run.stopped == "max_fetches":
@@ -553,4 +1200,9 @@ def read_site(url: str, max_pages: int = 15, on_page: Callable[[int, str], None]
     if run.robots_skipped:
         n = run.robots_skipped
         warnings.append(f"Skipped {n} page{'s' * (n != 1)} that the site's robots.txt asks crawlers not to read.")
-    return CrawlReport(run.start_url, pages, run.fetched, run.stopped, js_only, warnings)
+    info = _site_info_page(run, pages, run.start_url)
+    if info is not None:
+        pages.append(info)
+    if run.jina_calls:
+        log.info("read %s: %d pages, %d rendered, %d renderer calls", run.start_url, len(pages), run.rendered, run.jina_calls)
+    return CrawlReport(run.start_url, pages, run.fetched, run.stopped, js_only, warnings, run.rendered, run.jina_calls)

@@ -60,10 +60,15 @@ Endpoints
        turns, 1,000 chars each), site_label?, site_lang?, session_id?, translate_query? (bool)}
        -> {answer, sources: [{n, title, url, passage}] (the cited passages; all of them when none is cited),
            mode ("ai" | "extractive"), not_found (the answer says the site does not cover it), cited, notice}.
-       Same per-session, per-IP and daily USD caps as /api/chat: over a cap -> mode "extractive" with the caps'
-       friendly message as the answer and every passage as a source. translate_query: true (with site_lang, no
-       passages needed) -> {query}: the question as a short search query in site_lang (unchanged when the AI is off
-       or a cap is reached); optional hint (max 900 chars): words the site uses, preferred by the translation.
+       Its own caps, apart from /api/chat's so the WordPress demo can never use up /ask and /assistant:
+       WP_SESSION_CAP (12) per session, WP_IP_CAP (15) per IP (an IPv6 address counts as its /64) and WP_DAILY_USD
+       (0.25) per instance and day; answers are cut at WP_MAX_TOKENS (500) output tokens. Over a cap -> mode
+       "extractive" with the caps' friendly message as the answer and every passage as a source.
+       A "could not find" sentence cites nothing: its [n] marks are removed before the sources are chosen.
+       translate_query: true (with site_lang, no passages needed) -> {query}: the question as a short search query in
+       site_lang (unchanged when the AI is off or a cap is reached); it counts toward the same caps as an answer.
+       Optional hint (max 900 chars): words the site uses, preferred by the translation; cut to a plain word list
+       (at most 60 words) before it reaches the model.
        Origins: this route also accepts WP_DEMO_ORIGINS; every other POST refuses them.
   GET  /api/stats?days=7&limit=200 -> visit totals by day, country, city, page and referrer host + the newest events.
        Each event also has active_ms (time on page while visible and focused), scroll (% of the page reached) and
@@ -81,7 +86,9 @@ CLIENT_IP_HEADER (optional platform header with the visitor address), OPENROUTER
 KB_SECRET (32+ random bytes; needed for restore across instances), IP_RESTORE_CAP (60), JINA_API_KEY (optional),
 JINA_RPM (20), JS_MAX_PAGES (8; rendered pages count inside MAX_PAGES).
 WP_DEMO_ORIGINS (comma list, default https://playground.wordpress.net): origins allowed on POST /api/answer only
-(CORS preflight included), for the WordPress plugin's public demo.
+(CORS preflight included), for the WordPress plugin's public demo. WP_SESSION_CAP, WP_IP_CAP, WP_DAILY_USD,
+WP_MAX_TOKENS: the caps of POST /api/answer (see above). The caps live in each instance's memory: the AI key's own
+credit limit at OpenRouter is the only hard stop across instances.
 Visit log: KV_REST_API_URL + KV_REST_API_TOKEN (or UPSTASH_REDIS_REST_URL + UPSTASH_REDIS_REST_TOKEN; none = in
 memory), STATS_KEY, HIT_IP_CAP (100), HIT_DAILY_CAP (3000) (both per instance).
 """
@@ -152,6 +159,7 @@ WP_PASSAGE_CHARS = 1500
 WP_HISTORY_MESSAGES = 6  # three turns: a question and its answer each
 WP_HISTORY_CHARS = 1000
 WP_LABEL_CHARS = 100
+WP_HINT_WORDS = 60  # the translation hint is cut to a plain word list: words, not instructions
 
 MESSAGES = {
     "kb_expired": "This site was read more than an hour ago and has been cleared. Reading it again now.",
@@ -556,10 +564,10 @@ class _CORSByPath:
 
 def create_app(*, stream=None, translate=None, complete=None, crawl=None, clock=time.time,
                budget: budget_mod.Budget | None = None, quick=None, check_key: bool | None = None,
-               visits=None) -> FastAPI:
+               visits=None, wp_budget: budget_mod.Budget | None = None) -> FastAPI:
     """`stream`, `translate`, `complete`, `crawl`, `quick`, `visits` are injectable for tests (default: the real
     engine; visits: the store visits.from_env() picks). `quick(messages, schema) -> (data, usage)` makes the
-    starter-question call."""
+    starter-question call. `budget` guards /api/chat and the other demos; `wp_budget` guards POST /api/answer."""
     app = FastAPI(title="Site chatbot API", docs_url=None, redoc_url=None)
     origins = [o.strip() for o in os.environ.get("CORS_ORIGINS", "https://slimanechanchoul.com").split(",") if o.strip()]
     origin_regex = os.environ.get("CORS_ORIGIN_REGEX", r"^http://(localhost|127\.0\.0\.1)(:\d+)?$")
@@ -593,6 +601,11 @@ def create_app(*, stream=None, translate=None, complete=None, crawl=None, clock=
                                             daily_usd=_env_float("DAILY_USD", 1.0),
                                             ip_crawl_cap=_env_int("IP_CRAWL_CAP", 5), clock=clock,
                                             ip_upload_cap=_env_int("IP_UPLOAD_CAP", 10))
+    # POST /api/answer (WordPress demo) has its own caps, so it can never use up the budget of /ask and /assistant.
+    st.wp_budget = wp_budget or budget_mod.Budget(session_cap=_env_int("WP_SESSION_CAP", 12),
+                                                  ip_cap=_env_int("WP_IP_CAP", 15),
+                                                  daily_usd=_env_float("WP_DAILY_USD", 0.25), clock=clock)
+    st.wp_max_tokens = max(100, _env_int("WP_MAX_TOKENS", 500))
     st.restores = RestoreCap(_env_int("IP_RESTORE_CAP", 60), clock=clock)
     st.cache = cache_mod.AnswerCache(clock=clock)
     st.kbs = KBStore(max_entries=_env_int("KB_MAX", 40), ttl_s=_env_int("KB_TTL_S", 3600), clock=clock)
@@ -610,7 +623,7 @@ def create_app(*, stream=None, translate=None, complete=None, crawl=None, clock=
     def healthz():
         key = llm.key_state() if st.real_ai else "ok"
         return {"ok": True, "ai": (llm.available() and key not in ("missing", "rejected")) if st.real_ai else True,
-                "kbs": len(st.kbs), "budget": st.budget.snapshot(), "inst": st.inst,
+                "kbs": len(st.kbs), "budget": st.budget.snapshot(), "wp_budget": st.wp_budget.snapshot(), "inst": st.inst,
                 "up_s": int(time.monotonic() - st.boot), "ai_key": key, "restore": bool(os.environ.get("KB_SECRET"))}
 
     @app.get("/api/examples")
@@ -1142,7 +1155,8 @@ def _wp_request(body) -> dict:
         raise _BadRequest("site_lang must be a language code such as en or fr.")
     label = " ".join(_text(body.get("site_label"), "site_label", WP_LABEL_CHARS, required=False).split())
     session = _text(body.get("session_id"), "session_id", 64, required=False)
-    hint = " ".join(_text(body.get("hint"), "hint", 900, required=False).split())
+    # Words, not sentences: an instruction written in the hint reaches the model only as a list of loose words.
+    hint = ", ".join(re.findall(r"[\w'-]{2,30}", _text(body.get("hint"), "hint", 900, required=False))[:WP_HINT_WORDS])
     history = body.get("history") or []
     if not isinstance(history, list) or len(history) > WP_HISTORY_MESSAGES:
         raise _BadRequest("history holds at most 3 turns.")
@@ -1176,33 +1190,63 @@ class _Given:
         self.lang = search.detect_lang(question)
 
 
+def _wp_translate(st, req: dict, session: str, ip: str) -> str:
+    """translate_query mode: one short model call, counted toward the same caps as an answer (on its own, this route
+    would otherwise be a free text tool). The question comes back unchanged when a cap is reached or the call fails."""
+    bud = st.wp_budget
+    translate = st.translate
+    usages: list[llm.Usage] = []
+    if translate is None and llm.available():
+        def translate(text: str, lang: str, hint: str = "") -> str:
+            return llm.translate_query(text, lang, hint=hint, on_usage=usages.append)
+    if translate is None or not bud.check(session, ip, reserve=True).allowed:
+        return req["question"]
+    query = req["question"]
+    try:
+        try:  # the site's own words make the translated search find them ("refund", not "reimbursement")
+            out = translate(req["question"], req["lang"], hint=req["hint"]) if req["hint"] else \
+                translate(req["question"], req["lang"])
+        except TypeError:  # a translate(text, lang) without the hint
+            out = translate(req["question"], req["lang"])
+        query = (out or "").strip() or req["question"]
+    except Exception:  # noqa: BLE001 - a failed translation keeps the question
+        query = req["question"]
+    finally:
+        u = usages[-1] if usages else llm.Usage()
+        bud.record(session, ip, llm.Usage(u.prompt_tokens, u.completion_tokens, u.cost_usd, u.model, 1), reserved=True)
+    return query
+
+
+_SENTENCE = re.compile(r"[^.!?\u061F\n]+[.!?\u061F]*")
+_CITE_MARK = re.compile(r"\s*\[\d+(?:\s*,\s*\d+)*\]")
+
+
+def _uncite_not_found(text: str) -> str:
+    """A "could not find" sentence cites nothing: drop the [n] marks of the sentences that say so, so the page the
+    model named is not shown as a source. The other sentences of a partial answer keep theirs."""
+    return _SENTENCE.sub(lambda m: _CITE_MARK.sub("", m.group(0)) if _NOT_FOUND.search(m.group(0)) else m.group(0), text)
+
+
+def _wp_source(req: dict) -> str:
+    """Cache key of everything in the prompt but the question: site name, site language and each passage's url, title
+    and text (the same passages under another site name must not get that site's cached answer)."""
+    blob = json.dumps([req["label"], req["lang"], [(p.url, p.title, p.text) for p in req["passages"]]],
+                      ensure_ascii=False)
+    return "wp:" + hashlib.sha1(blob.encode("utf-8", "replace")).hexdigest()[:16]
+
+
 def _wp_answer(st, req: dict, ip: str) -> JSONResponse:
-    bud = st.budget
+    bud = st.wp_budget
     session = req["session"] or f"ip:{ip}"
     if req["translate"]:
-        query = req["question"]
-        translate = st.translate
-        if translate is None and llm.available():
-            def translate(text: str, lang: str, hint: str = "") -> str:
-                return llm.translate_query(text, lang, hint=hint, on_usage=lambda u: bud.record(
-                    session, ip, llm.Usage(u.prompt_tokens, u.completion_tokens, u.cost_usd, u.model, 0)))
-        if translate is not None and bud.check(session, ip).allowed:
-            try:
-                try:  # the site's own words make the translated search find them ("refund", not "reimbursement")
-                    out = translate(req["question"], req["lang"], hint=req["hint"]) if req["hint"] else \
-                        translate(req["question"], req["lang"])
-                except TypeError:  # a translate(text, lang) without the hint
-                    out = translate(req["question"], req["lang"])
-                query = (out or "").strip() or req["question"]
-            except Exception:  # noqa: BLE001 - a failed translation keeps the question
-                query = req["question"]
+        query = _wp_translate(st, req, session, ip)
         return JSONResponse({"query": query[:WP_QUESTION_CHARS]}, headers=NO_STORE)
 
     passages = req["passages"]
     run = answer.ask(req["label"], req["question"], _Given(req["question"], passages), req["history"],
-                     source="wp:" + cache_mod.source_id(passages), session=session, ip=ip, cache=st.cache, budget=bud,
+                     source=_wp_source(req), session=session, ip=ip, cache=st.cache, budget=bud,
                      stream=st.stream, trim=lambda p, q: p, max_passages=len(passages),
-                     system=answer.GIVEN_PASSAGES_SYSTEM)
+                     system=answer.GIVEN_PASSAGES_SYSTEM, max_tokens=st.wp_max_tokens)
     try:
         for _ in run:
             pass
@@ -1220,10 +1264,13 @@ def _wp_answer(st, req: dict, ip: str) -> JSONResponse:
         message = note if code not in ("ai_busy", "ai_unavailable") else MESSAGES[code]
         return JSONResponse({"answer": message, "sources": sources, "mode": "extractive", "not_found": False,
                              "cited": [], "notice": code}, headers=NO_STORE)
-    not_found = bool(_NOT_FOUND.search(res.text[:400]))
-    cited = [n for n in res.cited if 1 <= n <= len(sources)]
+    text = res.text
+    not_found = bool(_NOT_FOUND.search(text[:400]))
+    if not_found:
+        text = _uncite_not_found(text)
+    cited = [n for n in answer.parse_citations(text, len(sources)) if 1 <= n <= len(sources)]
     used = [sources[n - 1] for n in cited] if cited else ([] if not_found else sources)
-    return JSONResponse({"answer": res.text, "sources": used, "mode": "ai", "not_found": not_found, "cited": cited,
+    return JSONResponse({"answer": text, "sources": used, "mode": "ai", "not_found": not_found, "cited": cited,
                          "notice": None}, headers=NO_STORE)
 
 

@@ -3,6 +3,7 @@ site reads per IP and PDF uploads per IP. One shared instance per process; count
 Also pick_client_ip(): the visitor address for the per-IP caps, shared by api/main.py and app.py."""
 from __future__ import annotations
 
+import ipaddress
 import threading
 import time
 from dataclasses import dataclass
@@ -22,15 +23,30 @@ def pick_client_ip(forwarded, peer: str | None, hops: int = 1, platform_ip: str 
     its values). Its leftmost entry is whatever the visitor sent, so trusting it would let anyone dodge the
     per-IP caps. Take instead the entry our own proxy wrote: the `hops`-th from the right (1 = the address the
     platform's proxy saw). `platform_ip` (a header the platform sets and overwrites) wins when present.
-    hops=0 or no header: the TCP peer."""
+    hops=0 or no header: the TCP peer. An IPv6 address counts as its /64 network (see ip_bucket)."""
     if platform_ip and platform_ip.strip():
-        return platform_ip.strip()[:64]
+        return ip_bucket(platform_ip.strip()[:64])
     if isinstance(forwarded, str):
         forwarded = [forwarded]
     entries = [e.strip() for e in ",".join(v for v in (forwarded or []) if v).split(",") if e.strip()]
     if entries and hops > 0:
-        return entries[-min(hops, len(entries))][:64]
-    return (peer or "unknown")[:64]
+        return ip_bucket(entries[-min(hops, len(entries))][:64])
+    return ip_bucket((peer or "unknown")[:64])
+
+
+def ip_bucket(ip: str) -> str:
+    """The key the per-IP caps count under: an IPv4 address as is; an IPv6 address as its /64 network, because one
+    connection usually holds a whole /64 (per-address caps would not limit it); an IPv4 address written as IPv6
+    (::ffff:1.2.3.4) as the IPv4 address. Anything else unchanged."""
+    try:
+        addr = ipaddress.ip_address(ip.strip().strip("[]"))
+    except ValueError:
+        return ip
+    if addr.version == 6:
+        if addr.ipv4_mapped is not None:
+            return str(addr.ipv4_mapped)
+        return f"{ipaddress.IPv6Address(int(addr) >> 64 << 64)}/64"  # int() also takes a zone id (fe80::1%eth0)
+    return ip
 
 
 @dataclass

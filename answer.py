@@ -203,9 +203,11 @@ class AnswerRun:
 
     def __init__(self, site: str, question: str, found, history: list[dict], *, source: str, session: str, ip: str,
                  cache=None, budget=None, stream=llm.stream_text, trim: Callable[[Passage, str], Passage] | None = None,
-                 cache_any_turn: bool = False, max_passages: int = MAX_PASSAGES, system: str | None = None):
+                 cache_any_turn: bool = False, max_passages: int = MAX_PASSAGES, system: str | None = None,
+                 max_tokens: int = ANSWER_MAX_TOKENS):
         self._args = (site, question, found, list(history or []))
         self._max_passages, self._system = max_passages, system  # /api/answer: up to 6 given passages, its own prompt
+        self._max_tokens = max_tokens  # /api/answer: short answers only, so a call cannot be used for long texts
         self._cache_any_turn = cache_any_turn  # pinned examples: an exact cached question is served even mid-chat
         self._source, self._session, self._ip = source, session, ip
         self._cache, self._budget, self._stream = cache, budget, stream
@@ -255,7 +257,7 @@ class AnswerRun:
     def _model(self, messages: list[dict], passages: list[Passage], use_cache: bool, question: str) -> Iterator[str]:
         usages: list[llm.Usage] = []
         try:
-            chunks = self._stream(messages, max_tokens=ANSWER_MAX_TOKENS, on_usage=usages.append)
+            chunks = self._stream(messages, max_tokens=self._max_tokens, on_usage=usages.append)
         except TypeError:  # an older stream(messages) without the new keywords
             chunks = self._stream(messages)
         full, sent, stopped, failed = "", 0, False, False
@@ -314,10 +316,10 @@ class AnswerRun:
 
 def ask(site: str, question: str, found, history: list[dict], *, source: str, session: str, ip: str,
         cache=None, budget=None, stream=llm.stream_text, trim=None, cache_any_turn: bool = False,
-        max_passages: int = MAX_PASSAGES, system: str | None = None) -> AnswerRun:
+        max_passages: int = MAX_PASSAGES, system: str | None = None, max_tokens: int = ANSWER_MAX_TOKENS) -> AnswerRun:
     """One answer, at most one model call. `found` is a search.SearchResult (duck typed:
     .matched, .passages, .search_query). Iterate the returned run, then read run.result.
-    `max_passages` and `system` (a template with {site}) default to the chat's own values."""
+    `max_passages`, `system` (a template with {site}) and `max_tokens` default to the chat's own values."""
     return AnswerRun(site, question, found, history, source=source, session=session, ip=ip,
                      cache=cache, budget=budget, stream=stream, trim=trim, cache_any_turn=cache_any_turn,
-                     max_passages=max_passages, system=system)
+                     max_passages=max_passages, system=system, max_tokens=max_tokens)

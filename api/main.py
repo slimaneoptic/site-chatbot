@@ -54,6 +54,17 @@ Endpoints
        max_scroll_pct, clicks: [{l, ms, n?}] (25 max)} -> 204, stored apart (no IP, no geo, no device), same Origin,
        bot and cap rules; 400 when page, sid or the clicks list is not valid. A body without type "leave" is a page
        view, handled exactly as before (2 KB max).
+  POST /api/answer                 -> answers from passages a WordPress site sent (the Site Answers plugin's online
+       demo on WordPress Playground). JSON (any Content-Type, max 20 KB): {question (1-500 chars),
+       passages: [{n, url (http/https), title, text (max 1,500 chars)}] (1-6), history? ([{role, content}], max 3
+       turns, 1,000 chars each), site_label?, site_lang?, session_id?, translate_query? (bool)}
+       -> {answer, sources: [{n, title, url, passage}] (the cited passages; all of them when none is cited),
+           mode ("ai" | "extractive"), not_found (the answer says the site does not cover it), cited, notice}.
+       Same per-session, per-IP and daily USD caps as /api/chat: over a cap -> mode "extractive" with the caps'
+       friendly message as the answer and every passage as a source. translate_query: true (with site_lang, no
+       passages needed) -> {query}: the question as a short search query in site_lang (unchanged when the AI is off
+       or a cap is reached); optional hint (max 900 chars): words the site uses, preferred by the translation.
+       Origins: this route also accepts WP_DEMO_ORIGINS; every other POST refuses them.
   GET  /api/stats?days=7&limit=200 -> visit totals by day, country, city, page and referrer host + the newest events.
        Each event also has active_ms (time on page while visible and focused), scroll (% of the page reached) and
        clicks [{l, ms, n?}] from its leave summary (None, None, [] without one); engagement = per page: n
@@ -69,6 +80,8 @@ TRUSTED_PROXY_HOPS (1: the per-IP caps use the X-Forwarded-For entry our proxy a
 CLIENT_IP_HEADER (optional platform header with the visitor address), OPENROUTER_API_KEY (spaces/quotes trimmed),
 KB_SECRET (32+ random bytes; needed for restore across instances), IP_RESTORE_CAP (60), JINA_API_KEY (optional),
 JINA_RPM (20), JS_MAX_PAGES (8; rendered pages count inside MAX_PAGES).
+WP_DEMO_ORIGINS (comma list, default https://playground.wordpress.net): origins allowed on POST /api/answer only
+(CORS preflight included), for the WordPress plugin's public demo.
 Visit log: KV_REST_API_URL + KV_REST_API_TOKEN (or UPSTASH_REDIS_REST_URL + UPSTASH_REDIS_REST_TOKEN; none = in
 memory), STATS_KEY, HIT_IP_CAP (100), HIT_DAILY_CAP (3000) (both per instance).
 """
@@ -129,6 +142,16 @@ PAGE_LIST_MAX = 20  # page_list in the /api/kb answer: first pages in crawl orde
 MAX_QUESTION_CHARS = 1000
 MAX_HISTORY = 10
 MAX_HISTORY_CHARS = 4000  # per message; answer.py trims further for the model
+
+# POST /api/answer (WordPress plugin demo): small bodies, a handful of passages chosen by the site itself.
+WP_PATHS = ("/api/answer",)
+WP_MAX_BYTES = 20_000
+WP_QUESTION_CHARS = 500
+WP_MAX_PASSAGES = 6
+WP_PASSAGE_CHARS = 1500
+WP_HISTORY_MESSAGES = 6  # three turns: a question and its answer each
+WP_HISTORY_CHARS = 1000
+WP_LABEL_CHARS = 100
 
 MESSAGES = {
     "kb_expired": "This site was read more than an hour ago and has been cleared. Reading it again now.",
@@ -504,7 +527,8 @@ def _left_today(bud, session: str, ip: str) -> int:
 
 class _OriginGuard:
     """Pure ASGI (streams pass through untouched): a POST that carries an Origin header outside the CORS list is
-    refused before any body is read, model called or cap counted. No Origin header (curl, server-to-server) passes."""
+    refused before any body is read, model called or cap counted. No Origin header (curl, server-to-server) passes.
+    `allowed(origin, path)`: the WordPress demo origins pass on WP_PATHS only."""
 
     def __init__(self, app, allowed):
         self.app, self.allowed = app, allowed
@@ -512,10 +536,22 @@ class _OriginGuard:
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http" and scope.get("method") == "POST":
             origin = next((v.decode("latin-1") for k, v in scope.get("headers") or [] if k == b"origin"), None)
-            if origin is not None and not self.allowed(origin):
+            if origin is not None and not self.allowed(origin, scope.get("path") or ""):
                 await _err("origin_not_allowed", status=403)(scope, receive, send)
                 return
         await self.app(scope, receive, send)
+
+
+class _CORSByPath:
+    """Two CORS policies on one app: WP_PATHS also answer the WordPress demo origins (preflight included); every
+    other path keeps the site's own list. Pure ASGI, so streams pass through untouched."""
+
+    def __init__(self, app, default: dict, wp: dict):
+        self.default, self.wp = CORSMiddleware(app, **default), CORSMiddleware(app, **wp)
+
+    async def __call__(self, scope, receive, send):
+        cors = self.wp if scope["type"] == "http" and scope.get("path") in WP_PATHS else self.default
+        await cors(scope, receive, send)
 
 
 def create_app(*, stream=None, translate=None, complete=None, crawl=None, clock=time.time,
@@ -527,14 +563,21 @@ def create_app(*, stream=None, translate=None, complete=None, crawl=None, clock=
     app = FastAPI(title="Site chatbot API", docs_url=None, redoc_url=None)
     origins = [o.strip() for o in os.environ.get("CORS_ORIGINS", "https://slimanechanchoul.com").split(",") if o.strip()]
     origin_regex = os.environ.get("CORS_ORIGIN_REGEX", r"^http://(localhost|127\.0\.0\.1)(:\d+)?$")
-    app.add_middleware(CORSMiddleware, allow_origins=origins, allow_origin_regex=origin_regex,
-                       allow_methods=["GET", "POST", "OPTIONS"], allow_headers=["Content-Type", "Accept"], max_age=7200)
+    wp_origins = [o.strip() for o in os.environ.get("WP_DEMO_ORIGINS", "https://playground.wordpress.net").split(",")
+                  if o.strip() and o.strip() != "*"]  # never a wildcard: anyone could spend the caps
+    cors = dict(allow_origin_regex=origin_regex, allow_methods=["GET", "POST", "OPTIONS"],
+                allow_headers=["Content-Type", "Accept"], max_age=7200)
+    app.add_middleware(_CORSByPath, default={**cors, "allow_origins": origins},
+                       wp={**cors, "allow_origins": origins + [o for o in wp_origins if o not in origins]})
     origin_re = re.compile(origin_regex) if origin_regex else None
 
     def origin_ok(o: str) -> bool:  # the same test CORSMiddleware makes
         return "*" in origins or o in origins or bool(origin_re is not None and origin_re.fullmatch(o))
 
-    app.add_middleware(_OriginGuard, allowed=origin_ok)
+    def post_origin_ok(o: str, path: str) -> bool:
+        return origin_ok(o) or (path in WP_PATHS and o in wp_origins)
+
+    app.add_middleware(_OriginGuard, allowed=post_origin_ok)
 
     st = app.state
     st.stream = stream or llm.stream_text
@@ -850,6 +893,27 @@ def create_app(*, stream=None, translate=None, complete=None, crawl=None, clock=
         return Response("﻿" + out.getvalue(), media_type="text/csv; charset=utf-8",
                         headers={"Content-Disposition": f'attachment; filename="{kb.id}.csv"'})
 
+    # ------------------------------------------------------------ answers from given passages (WordPress plugin demo)
+
+    @app.post("/api/answer")
+    async def given_answer(request: Request):
+        ip = client_ip(request)
+        if _declared_size(request) > WP_MAX_BYTES:
+            return _err("too_big", status=413)
+        raw = b""
+        async for chunk in request.stream():  # counted as it arrives: a chunked body has no Content-Length
+            raw += chunk
+            if len(raw) > WP_MAX_BYTES:
+                return _err("too_big", status=413)
+        try:
+            req = _wp_request(json.loads(raw.decode("utf-8") or "null"))
+        except _BadRequest as e:
+            return _err("bad_request", str(e))
+        except (ValueError, RecursionError):
+            return _err("bad_request")
+        from starlette.concurrency import run_in_threadpool
+        return await run_in_threadpool(_wp_answer, st, req, ip)
+
     # ------------------------------------------------------------ visit log (slimanechanchoul.com/hit.js)
 
     @app.post("/api/hit")
@@ -1049,6 +1113,118 @@ def _answerable(kb: KB, followups: list[str], question: str) -> list[str]:
         except Exception:  # noqa: BLE001 - a check that fails keeps the chip
             out.append(f)
     return out
+
+
+class _BadRequest(ValueError):
+    """A /api/answer body that breaks a rule; the message says which (visitor-safe, no internals)."""
+
+
+def _text(v, name: str, max_chars: int, *, required: bool = True) -> str:
+    if v is None and not required:
+        return ""
+    if not isinstance(v, str) or (required and not v.strip()):
+        raise _BadRequest(f"{name} must be a non-empty text.")
+    if len(v) > max_chars:
+        raise _BadRequest(f"{name} is longer than {max_chars} characters.")
+    return v.strip()
+
+
+def _wp_request(body) -> dict:
+    """Validate a /api/answer body; raises _BadRequest."""
+    if not isinstance(body, dict):
+        raise _BadRequest("Send a JSON object.")
+    translate = body.get("translate_query", False)
+    if not isinstance(translate, bool):
+        raise _BadRequest("translate_query must be true or false.")
+    question = _text(body.get("question"), "question", WP_QUESTION_CHARS)
+    lang = _text(body.get("site_lang"), "site_lang", 10, required=translate)
+    if lang and not re.fullmatch(r"[a-z]{2}(?:[-_][A-Za-z]{2})?", lang):
+        raise _BadRequest("site_lang must be a language code such as en or fr.")
+    label = " ".join(_text(body.get("site_label"), "site_label", WP_LABEL_CHARS, required=False).split())
+    session = _text(body.get("session_id"), "session_id", 64, required=False)
+    hint = " ".join(_text(body.get("hint"), "hint", 900, required=False).split())
+    history = body.get("history") or []
+    if not isinstance(history, list) or len(history) > WP_HISTORY_MESSAGES:
+        raise _BadRequest("history holds at most 3 turns.")
+    turns = []
+    for m in history:
+        if not isinstance(m, dict) or m.get("role") not in ("user", "assistant"):
+            raise _BadRequest("Each history item needs a role: user or assistant.")
+        turns.append({"role": m["role"], "content": _text(m.get("content"), "history content", WP_HISTORY_CHARS)})
+    passages = []
+    if not translate:
+        raw = body.get("passages")
+        if not isinstance(raw, list) or not 1 <= len(raw) <= WP_MAX_PASSAGES:
+            raise _BadRequest(f"Send 1 to {WP_MAX_PASSAGES} passages.")
+        for p in raw:
+            if not isinstance(p, dict):
+                raise _BadRequest("Each passage needs url, title and text.")
+            url = _text(p.get("url"), "passage url", 2000)
+            if not re.match(r"^https?://[^\s/]+", url, re.I):
+                raise _BadRequest("Passage URLs must start with http:// or https://.")
+            title = " ".join(_text(p.get("title"), "passage title", 300).split())
+            passages.append(search.Passage(url, title, _text(p.get("text"), "passage text", WP_PASSAGE_CHARS)))
+    return {"question": question, "lang": lang, "label": label or "this site", "session": session,
+            "history": turns, "passages": passages, "translate": translate, "hint": hint}
+
+
+class _Given:
+    """A SearchResult made of the passages the site sent: matched, in the site's own order."""
+
+    def __init__(self, question: str, passages: list):
+        self.matched, self.search_query, self.passages = True, question, passages
+        self.lang = search.detect_lang(question)
+
+
+def _wp_answer(st, req: dict, ip: str) -> JSONResponse:
+    bud = st.budget
+    session = req["session"] or f"ip:{ip}"
+    if req["translate"]:
+        query = req["question"]
+        translate = st.translate
+        if translate is None and llm.available():
+            def translate(text: str, lang: str, hint: str = "") -> str:
+                return llm.translate_query(text, lang, hint=hint, on_usage=lambda u: bud.record(
+                    session, ip, llm.Usage(u.prompt_tokens, u.completion_tokens, u.cost_usd, u.model, 0)))
+        if translate is not None and bud.check(session, ip).allowed:
+            try:
+                try:  # the site's own words make the translated search find them ("refund", not "reimbursement")
+                    out = translate(req["question"], req["lang"], hint=req["hint"]) if req["hint"] else \
+                        translate(req["question"], req["lang"])
+                except TypeError:  # a translate(text, lang) without the hint
+                    out = translate(req["question"], req["lang"])
+                query = (out or "").strip() or req["question"]
+            except Exception:  # noqa: BLE001 - a failed translation keeps the question
+                query = req["question"]
+        return JSONResponse({"query": query[:WP_QUESTION_CHARS]}, headers=NO_STORE)
+
+    passages = req["passages"]
+    run = answer.ask(req["label"], req["question"], _Given(req["question"], passages), req["history"],
+                     source="wp:" + cache_mod.source_id(passages), session=session, ip=ip, cache=st.cache, budget=bud,
+                     stream=st.stream, trim=lambda p, q: p, max_passages=len(passages),
+                     system=answer.GIVEN_PASSAGES_SYSTEM)
+    try:
+        for _ in run:
+            pass
+        res = run.result
+    except Exception:  # noqa: BLE001 - never a stack trace to the visitor
+        import logging
+        logging.getLogger(__name__).exception("answer failed")
+        return _err("server_error", status=500)
+    sources = [{"n": i, "title": p.title, "url": p.url, "passage": p.text} for i, p in enumerate(passages, start=1)]
+    if res is None or res.status not in ("answered", "cached"):
+        note = res.note if res is not None else ""
+        code = _REASON_BY_MESSAGE.get(note, "ai_busy")
+        if code == "ai_busy" and st.real_ai and llm.key_state() in ("missing", "rejected"):
+            code = "ai_unavailable"
+        message = note if code not in ("ai_busy", "ai_unavailable") else MESSAGES[code]
+        return JSONResponse({"answer": message, "sources": sources, "mode": "extractive", "not_found": False,
+                             "cited": [], "notice": code}, headers=NO_STORE)
+    not_found = bool(_NOT_FOUND.search(res.text[:400]))
+    cited = [n for n in res.cited if 1 <= n <= len(sources)]
+    used = [sources[n - 1] for n in cited] if cited else ([] if not_found else sources)
+    return JSONResponse({"answer": res.text, "sources": used, "mode": "ai", "not_found": not_found, "cited": cited,
+                         "notice": None}, headers=NO_STORE)
 
 
 EXTRACT_STOP = {  # budget stops for extraction: no "passages instead", Extract shows none

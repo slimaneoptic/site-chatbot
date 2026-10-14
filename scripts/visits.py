@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Who visited slimanechanchoul.com: the newest page views and the totals from the API's visit log (GET /api/stats).
+"""Who visited slimanechanchoul.com: the newest page views and the totals from the API's visit log (GET /api/stats),
+with the time each visitor spent on the page and what they clicked (from hit.js's leave summary; blank when the
+visitor is still there, left within half a second, or the API is older than the summaries).
 
   python3 scripts/visits.py                              # last 7 days, newest 30 visits
   python3 scripts/visits.py --days 30 --rows 60
@@ -83,11 +85,48 @@ def clean(v, n: int) -> str:
     return s if len(s) <= n else s[:max(1, n - 1)] + "…"
 
 
-def _table(headers: list[str], rows: list[list], widths: list[int]) -> list[str]:
+def _table(headers: list[str], rows: list[list], widths: list[int], notes: list[list[str]] | None = None) -> list[str]:
+    """Rows of fixed-width columns; notes[i] = lines printed under row i."""
     out = ["  " + "  ".join(h.ljust(w) for h, w in zip(headers, widths)).rstrip()]
-    for r in rows:
+    for i, r in enumerate(rows):
         out.append("  " + "  ".join(clean(c, w).ljust(w) for c, w in zip(r, widths)).rstrip())
+        out += (notes[i] if notes and i < len(notes) else [])
     return out
+
+
+def _ms(v):
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0 else None
+
+
+def duration(ms) -> str:
+    """Time on page: "45s", "3m 05s", "1h 02m"; "" when unknown."""
+    if _ms(ms) is None:
+        return ""
+    s = int(round(ms / 1000))
+    if s < 60:
+        return f"{s}s"
+    m, s = divmod(s, 60)
+    return f"{m}m {s:02d}s" if m < 60 else f"{m // 60}h {m % 60:02d}m"
+
+
+def _at(ms) -> str:
+    """When a click happened, from the page load: "0:07", "12:40"."""
+    s = int(round((_ms(ms) or 0) / 1000))
+    return f"{s // 60}:{s % 60:02d}"
+
+
+def click_lines(clicks, indent: int = 6, width: int = 110) -> list[str]:
+    """Clicks of one visit, in order: "Imagery 0:07, Topo 0:09, Zoom in x3 0:15" (x3 = clicked 3 times in a row)."""
+    items = []
+    for c in clicks if isinstance(clicks, list) else []:
+        if isinstance(c, dict) and c.get("l"):
+            n = c.get("n")
+            rep = f" x{clean(n, 5)}" if isinstance(n, int) and not isinstance(n, bool) and n > 1 else ""
+            items.append(f"{clean(c.get('l'), 40)}{rep} {_at(c.get('ms'))}")
+    if not items:
+        return []
+    pad = " " * indent
+    return textwrap.wrap(", ".join(items), width, initial_indent=pad + "clicks: ", subsequent_indent=pad + "        ")
 
 
 def render(data: dict, rows: int = 30, top: int = 10) -> str:
@@ -98,15 +137,28 @@ def render(data: dict, rows: int = 30, top: int = 10) -> str:
     evs = (data.get("events") or [])[:max(0, rows)]
     lines.append("")
     if evs:
-        lines.append(f"Newest {len(evs)} visits")
+        lines.append(f"Newest {len(evs)} visits (Time = time on page while the tab was in front)")
         lines += _table(
-            ["UTC time", "Session", "CC", "City", "Page", "From", "Device"],
+            ["UTC time", "Session", "CC", "City", "Page", "Time", "From", "Device"],
             [[f"{str(e.get('utc', ''))[5:10]} {str(e.get('utc', ''))[11:19]}", str(e.get("sid") or "")[:4],
               e.get("country") or "??", e.get("city") or "", f"{e.get('path', '')}{e.get('qs', '')}",
-              e.get("ref") or "(direct)", f"{e.get('device', '')} {e.get('browser', '')}"] for e in evs],
-            [14, 7, 2, 16, 30, 24, 15])
+              duration(e.get("active_ms")), e.get("ref") or "(direct)", f"{e.get('device', '')} {e.get('browser', '')}"]
+             for e in evs],
+            [14, 7, 2, 16, 30, 7, 24, 15],
+            [click_lines(e.get("clicks")) for e in evs])
     else:
         lines.append("No visits in this period.")
+    eng = [p for p in data.get("engagement") or [] if isinstance(p, dict)][:top]
+    if eng:
+        lines += ["", "Time on page (median) and most clicked, per page"]
+        for p in eng:
+            n = p.get("n") if isinstance(p.get("n"), int) else 0
+            lines.append(f"  {duration(p.get('median_ms')).rjust(7)}  {clean(p.get('key'), 60)}  "
+                         f"({n} visit{'' if n == 1 else 's'}, {clean(p.get('clicks', 0), 6)} clicks)")
+            tops = [f"{clean(t.get('key'), 40)} {clean(t.get('n'), 5)}" for t in p.get("top") or [] if isinstance(t, dict)]
+            if tops:
+                lines += textwrap.wrap(", ".join(tops), 110, initial_indent="           top: ",
+                                       subsequent_indent="                ")
     days = [f"{str(d.get('day', ''))[5:]} {d.get('views', 0)}" for d in data.get("by_day") or []]
     if days:
         lines += ["", "By day (views)"] + textwrap.wrap(", ".join(days), 100, initial_indent="  ",

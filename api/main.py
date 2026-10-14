@@ -50,7 +50,14 @@ Endpoints
        stored). Caps, both per instance (429): HIT_IP_CAP (100) hits per IP per day and HIT_DAILY_CAP (3000) hits
        per day, which keeps a month of fake hits inside the Upstash free tier (visits.py docstring). The Origin
        check stops other sites' pages, not scripts. Storage: visits.py (Upstash Redis or memory).
+       Leave summary, at most one more body per page view (max 4 KB): {type: "leave", page, sid, pv, active_ms,
+       max_scroll_pct, clicks: [{l, ms, n?}] (25 max)} -> 204, stored apart (no IP, no geo, no device), same Origin,
+       bot and cap rules; 400 when page, sid or the clicks list is not valid. A body without type "leave" is a page
+       view, handled exactly as before (2 KB max).
   GET  /api/stats?days=7&limit=200 -> visit totals by day, country, city, page and referrer host + the newest events.
+       Each event also has active_ms (time on page while visible and focused), scroll (% of the page reached) and
+       clicks [{l, ms, n?}] from its leave summary (None, None, [] without one); engagement = per page: n
+       summaries, median_ms, clicks, top labels; leaves_in_period (None when the summaries cannot be read).
        Header X-Stats-Key must equal STATS_KEY (401 otherwise); without STATS_KEY the route answers 404.
        503 store_unavailable when the store cannot be read. CLI: scripts/visits.py.
 
@@ -850,21 +857,26 @@ def create_app(*, stream=None, translate=None, complete=None, crawl=None, clock=
         origin = request.headers.get("origin")
         if not origin or not origin_ok(origin):  # a foreign Origin is already refused by _OriginGuard
             return _err("origin_not_allowed", status=403)
-        if _declared_size(request) > visits_mod.MAX_BODY:
+        if _declared_size(request) > visits_mod.MAX_LEAVE_BODY:
             return _err("too_big", status=413)
         raw = b""
         async for chunk in request.stream():
             raw += chunk
-            if len(raw) > visits_mod.MAX_BODY:
+            if len(raw) > visits_mod.MAX_LEAVE_BODY:
                 return _err("too_big", status=413)
+        body = _hit_json(raw)
+        leave = visits_mod.is_leave(body)
+        if len(raw) > visits_mod.MAX_BODY and not leave:  # a page view keeps its 2 KB; only a summary may be longer
+            return _err("too_big", status=413)
         ua = request.headers.get("user-agent", "")
         if visits_mod.is_bot(ua):
             return Response(status_code=204, headers=NO_STORE)  # dropped quietly, not counted
-        try:
-            body = json.loads(raw.decode("utf-8") or "null")
-        except ValueError:
+        if body is _NOT_JSON:
             return _err("bad_request")
-        event = visits_mod.make_event(body, request.headers, ua, st.clock())
+        if leave:  # time on page and clicks, at most one per page view (hit.js); no IP, no geo, no device
+            event = visits_mod.make_leave(body, st.clock())
+        else:  # a page view, exactly as before the leave summaries (bodies without "type" included)
+            event = visits_mod.make_event(body, request.headers, ua, st.clock())
         if event is None:
             return _err("bad_request")
         if not st.hit_caps.take(client_ip(request)):  # the IP is used here only, never stored
@@ -890,6 +902,15 @@ def create_app(*, stream=None, translate=None, complete=None, crawl=None, clock=
 
 
 NO_STORE = {"Cache-Control": "no-store"}
+_NOT_JSON = object()
+
+
+def _hit_json(raw: bytes):
+    """A /api/hit body as JSON, or _NOT_JSON (bad UTF-8, not JSON, or nested too deep to parse)."""
+    try:
+        return json.loads(raw.decode("utf-8") or "null")
+    except (ValueError, RecursionError):
+        return _NOT_JSON
 
 
 def _int_param(v: str | None, default: int) -> int:

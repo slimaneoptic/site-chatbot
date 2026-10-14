@@ -20,6 +20,16 @@ hit.js filters them and make_event filters again), title, ref (referrer host onl
 sid (random per-tab id), ct (client clock, ms), country, region, city, ip_tz (Vercel geo headers), device, browser,
 os (coarse families from the User-Agent).
 Never stored: the IP address, the full User-Agent, the referrer's path or query string, other query parameters.
+
+Leave summary (time on page and clicks): hit.js sends at most one more body per page view, the first time the page
+is hidden: {type: "leave", page, sid, pv, active_ms, max_scroll_pct, clicks: [{l, ms, n?}]} (max MAX_LEAVE_BODY
+bytes). The page goes in "page", not "path", so an API from before this change answers 400 instead of counting the
+summary as a page view. make_leave keeps type, ts, utc, path, sid, pv (the page view's client time = its ct, the
+join key), active_ms (0..2 h), scroll (0..100), clicks (MAX_CLICKS at most, labels cleaned and cut to MAX_LABEL:
+no control characters, e-mail addresses replaced, no query strings, "out:<host>" only for links to other sites).
+No geo, no device, no IP. Summaries go to their own list, visits:leave (LPUSH + LTRIM = 2 commands, no daily
+counters), so the page-view log, its 5,000 rows and the daily totals stay as they were. They count in HitCaps
+like page views: the quota bound above (4 commands at most per capped request) still holds.
 """
 from __future__ import annotations
 
@@ -28,6 +38,7 @@ import json
 import os
 import re
 import secrets
+import statistics
 import threading
 import time
 from collections import Counter, deque
@@ -48,7 +59,15 @@ WRITE_TIMEOUT = (1.0, 2.0)  # (connect, read) seconds
 READ_TIMEOUT = (2.0, 8.0)
 EVENTS_KEY = "visits:events"
 DAY_KEY = "visits:day:"
+LEAVE_KEY = "visits:leave"  # leave summaries (time on page, clicks), newest first, same length cap as the events
 TOP = 100                  # rows per "by_*" list in /api/stats
+MAX_LEAVE_BODY = 4096      # bytes of one leave summary; a page view stays at MAX_BODY
+MAX_CLICKS = 25            # clicks kept per summary
+MAX_LABEL = 40             # characters per click label
+MAX_ACTIVE_MS = 2 * 3600 * 1000      # active time per page view
+MAX_CLICK_MS = 7 * 86400 * 1000      # time of a click since the page loaded
+MAX_REPEAT = 1000          # n: the same label clicked several times in a row
+TOP_CLICKS = 10            # labels per page in /api/stats "engagement"
 
 # Crawlers, previews, monitors, headless browsers and HTTP libraries. Real in-app browsers (Instagram, Facebook,
 # LinkedIn, Telegram, DuckDuckGo, Yandex app...) must pass, so their bots are caught by "bot" alone; (?<!cu) keeps
@@ -66,6 +85,9 @@ _LANG = re.compile(r"[A-Za-z]{2,3}(?:-[A-Za-z0-9]{1,8}){0,4}")
 _TZ = re.compile(r"[A-Za-z0-9_+\-/]{1,64}")
 _SID = re.compile(r"[A-Za-z0-9_-]{1,40}")
 _REGION = re.compile(r"[A-Za-z0-9-]{1,16}")
+_SURROGATE = re.compile(r"[\ud800-\udfff]")  # half of an emoji cut by a client: it would break the UTF-8 output
+_EMAIL = re.compile(r"[^\s@]+@[^\s@]+\.[^\s@]+")
+_URL_REST = re.compile(r"((?:https?://|www\.)[^\s?#]*)[?#]\S*", re.I)  # a URL's query string and fragment
 
 
 # ---------------------------------------------------------------- one event
@@ -107,7 +129,7 @@ def ua_family(ua: str) -> tuple[str, str, str]:
 
 
 def _text(v, n: int) -> str:
-    return _CTRL.sub(" ", v).strip()[:n] if isinstance(v, str) else ""
+    return _CTRL.sub(" ", _SURROGATE.sub("", v)).strip()[:n] if isinstance(v, str) else ""
 
 
 def _match(v, rx: re.Pattern, n: int) -> str:
@@ -179,6 +201,74 @@ def counter_fields(event: dict) -> list[str]:
     return ["c:" + (event.get("country") or "??"), "p:" + event["path"]]
 
 
+# ---------------------------------------------------------------- leave summary (time on page, clicks)
+
+def is_leave(body) -> bool:
+    return isinstance(body, dict) and body.get("type") == "leave"
+
+
+def _clamp(v, lo: int, hi: int) -> int:
+    """A JSON number as an int inside [lo, hi] (out of range -> the nearest end); lo for anything else."""
+    if not isinstance(v, (int, float)) or isinstance(v, bool):
+        return lo
+    try:
+        x = int(v)
+    except (OverflowError, ValueError):  # inf / nan
+        return lo
+    return min(hi, max(lo, x))
+
+
+def clean_label(v) -> str:
+    """A click label as stored: one line, no control or bidi characters, e-mail addresses replaced, URLs without
+    their query string or fragment, cut to MAX_LABEL characters. "out:<host>" (a link to another site) must be a
+    plain host name. "" when nothing is left."""
+    if not isinstance(v, str):
+        return ""
+    s = _CTRL.sub(" ", _SURROGATE.sub("", v[:400]))
+    s = _URL_REST.sub(r"\1", _EMAIL.sub("(email)", s))
+    s = " ".join(s.split())
+    if s[:4].lower() == "out:":
+        host = s[4:].strip().lower().rstrip(".")
+        return ("out:" + host)[:MAX_LABEL] if _HOST.fullmatch(host) else ""
+    return s[:MAX_LABEL].strip()
+
+
+def make_leave(body, now: float) -> dict | None:
+    """The stored summary for one leave body, or None when it is not a valid one (needs type "leave", a page path
+    and the tab id). Numbers out of range are brought back into range; clicks that are not {l: text} are dropped."""
+    if not is_leave(body):
+        return None
+    page = body.get("page") if body.get("page") is not None else body.get("path")
+    path = _text(page, 200)
+    sid = _match(body.get("sid"), _SID, 40)
+    clicks_in = body.get("clicks")
+    if clicks_in is None:
+        clicks_in = []
+    if not path.startswith("/") or not sid or not isinstance(clicks_in, list):
+        return None
+    clicks = []
+    for c in clicks_in[:MAX_CLICKS]:
+        label = clean_label(c.get("l")) if isinstance(c, dict) else ""
+        if not label:
+            continue
+        item = {"l": label, "ms": _clamp(c.get("ms"), 0, MAX_CLICK_MS)}
+        n = _clamp(c.get("n"), 1, MAX_REPEAT)
+        if n > 1:
+            item["n"] = n
+        clicks.append(item)
+    return {
+        "type": "leave",
+        "ts": int(now),
+        "utc": datetime.fromtimestamp(int(now), timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "path": path,
+        "sid": sid,
+        "pv": _int(body.get("pv"), 10**12, 10**13),
+        "active_ms": _clamp(body.get("active_ms"), 0, MAX_ACTIVE_MS),
+        "scroll": _clamp(body.get("max_scroll_pct"), 0, 100),
+        "clicks": clicks,
+    }
+
+
 # ---------------------------------------------------------------- stores
 
 class MemoryStore:
@@ -189,6 +279,7 @@ class MemoryStore:
         self.max_events = max_events
         self._lock = threading.Lock()
         self._events: deque[str] = deque(maxlen=max_events)  # newest at the left, like LPUSH
+        self._leaves: deque[str] = deque(maxlen=max_events)
         self._days: dict[str, Counter] = {}
 
     def add(self, event: dict) -> bool:
@@ -202,9 +293,14 @@ class MemoryStore:
                 del self._days[min(self._days)]
         return True
 
-    def lrange(self, start: int, stop: int) -> list[str] | None:
+    def add_leave(self, event: dict) -> bool:
         with self._lock:
-            return list(self._events)[start:stop + 1]
+            self._leaves.appendleft(json.dumps(event, ensure_ascii=False, separators=(",", ":")))
+        return True
+
+    def lrange(self, start: int, stop: int, key: str = EVENTS_KEY) -> list[str] | None:
+        with self._lock:
+            return list(self._leaves if key == LEAVE_KEY else self._events)[start:stop + 1]
 
     def day_hashes(self, days: list[str]) -> list[dict[str, int]] | None:
         with self._lock:
@@ -260,8 +356,14 @@ class UpstashStore:
                 self._ttl_days = set(sorted(self._ttl_days | {day_key})[-3:])  # keys sort by date
         return ok
 
-    def lrange(self, start: int, stop: int) -> list[str] | None:
-        out = self._pipeline([["LRANGE", EVENTS_KEY, str(start), str(stop)]], READ_TIMEOUT)
+    def add_leave(self, event: dict) -> bool:
+        """A leave summary: 2 commands, no daily counters (they count page views only)."""
+        cmds = [["LPUSH", LEAVE_KEY, json.dumps(event, ensure_ascii=False, separators=(",", ":"))],
+                ["LTRIM", LEAVE_KEY, "0", str(self.max_events - 1)]]
+        return self._pipeline(cmds, WRITE_TIMEOUT) is not None
+
+    def lrange(self, start: int, stop: int, key: str = EVENTS_KEY) -> list[str] | None:
+        out = self._pipeline([["LRANGE", key, str(start), str(stop)]], READ_TIMEOUT)
         if out is None or not isinstance(out[0], list):
             return None
         return [x for x in out[0] if isinstance(x, str)]
@@ -300,7 +402,10 @@ def from_env(env=None) -> MemoryStore | UpstashStore:
 def safe_add(store, event: dict) -> None:
     """Background task after the 204: whatever happens, nothing reaches the visitor."""
     try:
-        store.add(event)
+        if event.get("type") == "leave":
+            store.add_leave(event)
+        else:
+            store.add(event)
     except Exception:  # noqa: BLE001
         pass
 
@@ -336,11 +441,106 @@ def _top(c: Counter) -> list[dict]:
     return [{"key": k, "n": n} for k, n in sorted(c.items(), key=lambda kv: (-kv[1], kv[0]))[:TOP]]
 
 
+def _period(read, since: float, cap: int, chunk: int) -> tuple[list[dict], bool] | None:
+    """The events newer than `since` of a newest-first list, read with read(start, stop) in chunks until one is
+    older. (events, partial): partial = the list is full and still inside the period (older ones were trimmed).
+    None when the store cannot be read."""
+    events, start, older, seen = [], 0, False, 0
+    while start < cap and not older:  # newest first, in chunks, until an event is older than the period
+        want = min(chunk, cap - start)
+        raw = read(start, start + want - 1)
+        if raw is None:
+            return None
+        seen += len(raw)
+        for item in raw:
+            try:
+                ev = json.loads(item)
+                ts = int(ev.get("ts") or 0) if isinstance(ev, dict) else None
+            except (TypeError, ValueError):
+                ts = None
+            if ts is None:
+                continue
+            if ts < since:
+                older = True
+                break
+            events.append(ev)
+        if len(raw) < want:
+            break
+        start += want
+    return events, not older and seen >= cap
+
+
+def _num(v) -> int | None:
+    return v if isinstance(v, int) and not isinstance(v, bool) else None
+
+
+def _clicks_of(leave: dict) -> list[dict]:
+    cl = leave.get("clicks")
+    return [c for c in cl if isinstance(c, dict) and isinstance(c.get("l"), str)] if isinstance(cl, list) else []
+
+
+def join_leaves(views: list[dict], leaves: list[dict]) -> list[dict]:
+    """Gives each page view `active_ms`, `scroll` and `clicks` from its leave summary (None, None, [] without one:
+    the visitor is still there, stayed under half a second, or the summary was lost). A summary belongs to the view
+    with the same sid and path whose ct equals its pv (the page-load time both carry); a summary without pv goes to
+    the oldest view of that sid and path, at most 5 s after it, that has none yet. Returns the summaries kept: a
+    second summary for the same page load (same sid, path and pv) is dropped."""
+    kept, seen, by_key = [], set(), {}
+    for lv in sorted(reversed(leaves), key=lambda e: _num(e.get("ts")) or 0):  # oldest first, in arrival order
+        sid, path, pv = lv.get("sid"), lv.get("path"), _num(lv.get("pv")) or 0
+        if not isinstance(sid, str) or not sid or not isinstance(path, str):
+            continue
+        if pv:
+            if (sid, path, pv) in seen:
+                continue
+            seen.add((sid, path, pv))
+        kept.append(lv)
+        by_key.setdefault((sid, path), []).append(lv)
+    for ev in views:
+        ev["active_ms"], ev["scroll"], ev["clicks"] = None, None, []
+    for ev in sorted(views, key=lambda e: _num(e.get("ts")) or 0):  # oldest first
+        cands = by_key.get((ev.get("sid"), ev.get("path"))) if ev.get("sid") else None
+        if not cands:
+            continue
+        ct, ts = _num(ev.get("ct")) or 0, _num(ev.get("ts")) or 0
+        pick = next((lv for lv in cands if ct and lv.get("pv") == ct), None)
+        if pick is None:
+            pick = next((lv for lv in cands if not lv.get("pv") and (_num(lv.get("ts")) or 0) >= ts - 5), None)
+        if pick is None:
+            continue
+        cands.remove(pick)
+        ev["active_ms"], ev["scroll"], ev["clicks"] = _num(pick.get("active_ms")), _num(pick.get("scroll")), \
+            _clicks_of(pick)
+    return kept
+
+
+def engagement(leaves: list[dict]) -> list[dict]:
+    """Per page: n = leave summaries, median_ms = median active time, clicks = clicks in all, top = the most clicked
+    labels (TOP_CLICKS). Pages with the most summaries first."""
+    pages: dict[str, dict] = {}
+    for lv in leaves:
+        path = lv.get("path")
+        if not isinstance(path, str):
+            continue
+        p = pages.setdefault(path, {"ms": [], "clicks": 0, "labels": Counter()})
+        p["ms"].append(_num(lv.get("active_ms")) or 0)
+        for c in _clicks_of(lv):
+            n = _num(c.get("n")) or 1
+            n = n if n > 0 else 1
+            p["clicks"] += n
+            p["labels"][c["l"]] += n
+    rows = [{"key": k, "n": len(v["ms"]), "median_ms": int(statistics.median(v["ms"])), "clicks": v["clicks"],
+             "top": _top(v["labels"])[:TOP_CLICKS]} for k, v in pages.items()]
+    return sorted(rows, key=lambda r: (-r["n"], r["key"]))[:TOP]
+
+
 def stats(store, now: float, days: int = 7, limit: int = 200, chunk: int = 1000) -> dict | None:
     """Visits of the last `days` UTC days (today included). by_day/by_country/by_page come from the daily
     counters (exact even after old events are trimmed); events, sessions, by_city and by_ref come from the stored
-    events of the period (`partial` = the log is full and may not reach back to the period start). None when the
-    store cannot be read."""
+    events of the period (`partial` = the log is full and may not reach back to the period start). Each event also
+    gets active_ms, scroll and clicks from its leave summary (join_leaves), and `engagement` holds the time and
+    clicks per page; leaves_in_period is None when the summaries cannot be read (the page views still come back).
+    None when the store cannot be read."""
     days = max(1, min(MAX_DAYS, int(days)))
     limit = max(0, min(MAX_EVENTS, int(limit)))
     today = datetime.fromtimestamp(now, timezone.utc).date()
@@ -360,30 +560,17 @@ def stats(store, now: float, days: int = 7, limit: int = 200, chunk: int = 1000)
                 by_page[f[2:]] += v
         by_day.append({"day": d, "views": n, "sessions": 0})
 
-    events, start, older, seen = [], 0, False, 0
     cap = getattr(store, "max_events", MAX_EVENTS)
-    while start < cap and not older:  # newest first, in chunks, until an event is older than the period
-        want = min(chunk, cap - start)
-        raw = store.lrange(start, start + want - 1)
-        if raw is None:
-            return None
-        seen += len(raw)
-        for item in raw:
-            try:
-                ev = json.loads(item)
-                ts = int(ev.get("ts") or 0) if isinstance(ev, dict) else None
-            except (TypeError, ValueError):
-                ts = None
-            if ts is None:
-                continue
-            if ts < since:
-                older = True
-                break
-            events.append(ev)
-        if len(raw) < want:
-            break
-        start += want
-    partial = not older and seen >= cap  # the log is full and still inside the period: older events were trimmed
+    got = _period(store.lrange, since, cap, chunk)
+    if got is None:
+        return None
+    events, partial = got  # partial: the log is full and still inside the period, older events were trimmed
+    try:
+        got_leaves = _period(lambda a, b: store.lrange(a, b, key=LEAVE_KEY), since, cap, chunk)
+    except Exception:  # noqa: BLE001 - a store without summaries: page views without time on page
+        got_leaves = None
+    leaves, leaves_partial = got_leaves if got_leaves is not None else ([], False)
+    leaves = join_leaves(events, leaves)
 
     sessions_by_day: dict[str, set] = {}
     by_city, by_ref = Counter(), Counter()
@@ -401,4 +588,6 @@ def stats(store, now: float, days: int = 7, limit: int = 200, chunk: int = 1000)
         "sessions": len({ev.get("sid") for ev in events if ev.get("sid")}),
         "by_day": by_day, "by_country": _top(by_country), "by_page": _top(by_page), "by_city": _top(by_city),
         "by_ref": _top(by_ref), "events": events[:limit], "events_in_period": len(events), "partial": partial,
+        "engagement": engagement(leaves), "leaves_in_period": len(leaves) if got_leaves is not None else None,
+        "leaves_partial": leaves_partial,
     }

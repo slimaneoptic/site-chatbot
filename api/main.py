@@ -42,6 +42,17 @@ Endpoints
        Content-Length header.
   GET  /api/kb/{id}.json           -> pages (text only) + the last extracted rows
   GET  /api/kb/{id}.csv            -> the last extracted rows as CSV (or the page list when nothing was extracted)
+  POST /api/hit                    -> 204. One page view of slimanechanchoul.com, sent by the site's /hit.js
+       (sendBeacon, text/plain or JSON, max 2 KB): {path, qs, title, ref, lang, tz, sw, sh, sid, t}. Needs an
+       allowed Origin header (no Origin -> 403). The server adds UTC time, country/region/city from Vercel's geo
+       headers, coarse device/browser/os from the User-Agent, keeps only the referrer's host and only the qs
+       parameters in visits.QS_KEEP. Never stored: the IP and the full User-Agent. Bots are dropped (204, nothing
+       stored). Caps, both per instance (429): HIT_IP_CAP (100) hits per IP per day and HIT_DAILY_CAP (3000) hits
+       per day, which keeps a month of fake hits inside the Upstash free tier (visits.py docstring). The Origin
+       check stops other sites' pages, not scripts. Storage: visits.py (Upstash Redis or memory).
+  GET  /api/stats?days=7&limit=200 -> visit totals by day, country, city, page and referrer host + the newest events.
+       Header X-Stats-Key must equal STATS_KEY (401 otherwise); without STATS_KEY the route answers 404.
+       503 store_unavailable when the store cannot be read. CLI: scripts/visits.py.
 
 Env: CORS_ORIGINS (comma list, default https://slimanechanchoul.com), CORS_ORIGIN_REGEX (default any
 http://localhost:* / 127.0.0.1:*); a POST whose Origin header matches neither gets 403 origin_not_allowed (text/plain
@@ -51,6 +62,8 @@ TRUSTED_PROXY_HOPS (1: the per-IP caps use the X-Forwarded-For entry our proxy a
 CLIENT_IP_HEADER (optional platform header with the visitor address), OPENROUTER_API_KEY (spaces/quotes trimmed),
 KB_SECRET (32+ random bytes; needed for restore across instances), IP_RESTORE_CAP (60), JINA_API_KEY (optional),
 JINA_RPM (20), JS_MAX_PAGES (8; rendered pages count inside MAX_PAGES).
+Visit log: KV_REST_API_URL + KV_REST_API_TOKEN (or UPSTASH_REDIS_REST_URL + UPSTASH_REDIS_REST_TOKEN; none = in
+memory), STATS_KEY, HIT_IP_CAP (100), HIT_DAILY_CAP (3000) (both per instance).
 """
 from __future__ import annotations
 
@@ -79,6 +92,7 @@ if str(ROOT) not in sys.path:
 from fastapi import FastAPI, Request  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 from fastapi.responses import JSONResponse, Response, StreamingResponse  # noqa: E402
+from starlette.background import BackgroundTask  # noqa: E402
 
 import answer  # noqa: E402
 import budget as budget_mod  # noqa: E402
@@ -89,6 +103,7 @@ import llm  # noqa: E402
 import scraper  # noqa: E402
 import search  # noqa: E402
 import starters as starters_mod  # noqa: E402
+import visits as visits_mod  # noqa: E402
 from scraper import Page  # noqa: E402
 
 FIXTURES = ROOT / "eval" / "fixtures"
@@ -122,6 +137,9 @@ MESSAGES = {
     "no_text": scraper.MESSAGES["no_text"],
     "no_fields": "Name the fields to extract, separated by commas (for example: product, price).",
     "no_ai": "Extraction needs the AI, which is not available right now.",
+    "hit_cap": "Too many page views from this network today.",
+    "unauthorized": "Wrong or missing X-Stats-Key header.",
+    "store_unavailable": "The visit log cannot be read right now.",
 }
 _REASON_BY_MESSAGE = {v: k for k, v in budget_mod.MESSAGES.items()}
 
@@ -494,17 +512,22 @@ class _OriginGuard:
 
 
 def create_app(*, stream=None, translate=None, complete=None, crawl=None, clock=time.time,
-               budget: budget_mod.Budget | None = None, quick=None, check_key: bool | None = None) -> FastAPI:
-    """`stream`, `translate`, `complete`, `crawl`, `quick` are injectable for tests (default: the real engine).
-    `quick(messages, schema) -> (data, usage)` makes the starter-question call."""
+               budget: budget_mod.Budget | None = None, quick=None, check_key: bool | None = None,
+               visits=None) -> FastAPI:
+    """`stream`, `translate`, `complete`, `crawl`, `quick`, `visits` are injectable for tests (default: the real
+    engine; visits: the store visits.from_env() picks). `quick(messages, schema) -> (data, usage)` makes the
+    starter-question call."""
     app = FastAPI(title="Site chatbot API", docs_url=None, redoc_url=None)
     origins = [o.strip() for o in os.environ.get("CORS_ORIGINS", "https://slimanechanchoul.com").split(",") if o.strip()]
     origin_regex = os.environ.get("CORS_ORIGIN_REGEX", r"^http://(localhost|127\.0\.0\.1)(:\d+)?$")
     app.add_middleware(CORSMiddleware, allow_origins=origins, allow_origin_regex=origin_regex,
                        allow_methods=["GET", "POST", "OPTIONS"], allow_headers=["Content-Type", "Accept"], max_age=7200)
     origin_re = re.compile(origin_regex) if origin_regex else None
-    app.add_middleware(_OriginGuard, allowed=lambda o: "*" in origins or o in origins or
-                       bool(origin_re is not None and origin_re.fullmatch(o)))  # the same test CORSMiddleware makes
+
+    def origin_ok(o: str) -> bool:  # the same test CORSMiddleware makes
+        return "*" in origins or o in origins or bool(origin_re is not None and origin_re.fullmatch(o))
+
+    app.add_middleware(_OriginGuard, allowed=origin_ok)
 
     st = app.state
     st.stream = stream or llm.stream_text
@@ -524,6 +547,9 @@ def create_app(*, stream=None, translate=None, complete=None, crawl=None, clock=
     st.cache = cache_mod.AnswerCache(clock=clock)
     st.kbs = KBStore(max_entries=_env_int("KB_MAX", 40), ttl_s=_env_int("KB_TTL_S", 3600), clock=clock)
     st.examples = load_examples(st.kbs)
+    st.visits = visits if visits is not None else visits_mod.from_env()
+    st.hit_caps = visits_mod.HitCaps(_env_int("HIT_IP_CAP", visits_mod.HIT_IP_CAP),
+                                     _env_int("HIT_DAILY_CAP", visits_mod.HIT_DAILY_CAP), clock=clock)
     _load_starter_answers(st)
     if check_key is None:
         check_key = st.real_ai and "PYTEST_CURRENT_TEST" not in os.environ
@@ -817,7 +843,60 @@ def create_app(*, stream=None, translate=None, complete=None, crawl=None, clock=
         return Response("﻿" + out.getvalue(), media_type="text/csv; charset=utf-8",
                         headers={"Content-Disposition": f'attachment; filename="{kb.id}.csv"'})
 
+    # ------------------------------------------------------------ visit log (slimanechanchoul.com/hit.js)
+
+    @app.post("/api/hit")
+    async def hit(request: Request):
+        origin = request.headers.get("origin")
+        if not origin or not origin_ok(origin):  # a foreign Origin is already refused by _OriginGuard
+            return _err("origin_not_allowed", status=403)
+        if _declared_size(request) > visits_mod.MAX_BODY:
+            return _err("too_big", status=413)
+        raw = b""
+        async for chunk in request.stream():
+            raw += chunk
+            if len(raw) > visits_mod.MAX_BODY:
+                return _err("too_big", status=413)
+        ua = request.headers.get("user-agent", "")
+        if visits_mod.is_bot(ua):
+            return Response(status_code=204, headers=NO_STORE)  # dropped quietly, not counted
+        try:
+            body = json.loads(raw.decode("utf-8") or "null")
+        except ValueError:
+            return _err("bad_request")
+        event = visits_mod.make_event(body, request.headers, ua, st.clock())
+        if event is None:
+            return _err("bad_request")
+        if not st.hit_caps.take(client_ip(request)):  # the IP is used here only, never stored
+            return _err("hit_cap", status=429)
+        return Response(status_code=204, headers=NO_STORE,
+                        background=BackgroundTask(visits_mod.safe_add, st.visits, event))
+
+    @app.get("/api/stats")
+    def visit_stats(request: Request):
+        key = os.environ.get("STATS_KEY", "").strip()
+        if not key:
+            return JSONResponse({"detail": "Not Found"}, status_code=404)
+        given = request.headers.get("x-stats-key", "")
+        if not hmac.compare_digest(given.encode("utf-8"), key.encode("utf-8")):
+            return _err("unauthorized", status=401)
+        q = request.query_params
+        out = visits_mod.stats(st.visits, st.clock(), _int_param(q.get("days"), 7), _int_param(q.get("limit"), 200))
+        if out is None:
+            return _err("store_unavailable", status=503)
+        return JSONResponse(out, headers=NO_STORE)
+
     return app
+
+
+NO_STORE = {"Cache-Control": "no-store"}
+
+
+def _int_param(v: str | None, default: int) -> int:
+    try:
+        return int(v) if v is not None else default
+    except ValueError:
+        return default
 
 
 def _csv_safe(v) -> str:

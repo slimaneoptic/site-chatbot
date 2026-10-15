@@ -1,6 +1,7 @@
 """Daily guards for the public demo: AI answers per session and per IP, a global USD budget,
 site reads per IP and PDF uploads per IP. One shared instance per process; counters reset at 00:00 UTC.
-Also pick_client_ip(): the visitor address for the per-IP caps, shared by api/main.py and app.py."""
+Also pick_client_ip(): the visitor address for the per-IP caps, shared by api/main.py and app.py, and DailyCap: the
+hard daily USD cap of llm.py's Claude fallback."""
 from __future__ import annotations
 
 import ipaddress
@@ -172,3 +173,46 @@ class Budget:
             self._reset_if_new_day()
             return {"day": self._day, "spent_usd": round(self._spent, 6), "questions": self._questions, "crawls": self._crawls,
                     "uploads": self._uploads, "in_flight": len(self._pending)}
+
+
+class DailyCap:
+    """A hard daily USD cap for one paid AI provider (the Claude fallback in llm.py), kept like Budget's counters: in
+    this instance's memory, reset at 00:00 UTC. hold() books a call's worst-case cost before the call, so parallel
+    calls can't pass the cap together; settle() swaps that hold for the real cost read from the response usage."""
+
+    def __init__(self, daily_usd: float, clock=time.time):
+        self.daily_usd = daily_usd
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._day = ""
+        self._reset_if_new_day()
+
+    def _reset_if_new_day(self) -> None:  # call with the lock held (or from __init__)
+        day = datetime.fromtimestamp(self._clock(), timezone.utc).date().isoformat()
+        if day != self._day:
+            self._day, self._spent, self._held = day, 0.0, 0.0
+
+    def hold(self, usd: float) -> tuple[str, float] | None:
+        """Book `usd` when it still fits under today's cap: returns the ticket for settle(), or None (cap reached)."""
+        usd = max(0.0, float(usd or 0.0))
+        with self._lock:
+            self._reset_if_new_day()
+            if self._spent + self._held + usd > self.daily_usd:
+                return None
+            self._held += usd
+            return (self._day, usd)
+
+    def settle(self, ticket: tuple[str, float], cost_usd: float) -> None:
+        """Free the ticket's hold (unless the day changed since) and add the call's real cost."""
+        with self._lock:
+            self._reset_if_new_day()
+            day, usd = ticket
+            if day == self._day:
+                self._held = max(0.0, self._held - usd)
+            self._spent += max(0.0, float(cost_usd or 0.0))
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            self._reset_if_new_day()
+            return {"day": self._day, "spent_usd": round(self._spent, 6), "cap_usd": self.daily_usd,
+                    "in_flight_usd": round(self._held, 6)}

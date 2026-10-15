@@ -8,6 +8,7 @@ dependencies = [
     "fastapi>=0.115",
     "python-multipart>=0.0.9",
     "requests>=2.31",
+    "anthropic>=1.14,<2",  # Claude fallback, used only when ANTHROPIC_API_KEY is set
     "trafilatura>=2.0",
     "lxml>=5.0",
     "rank_bm25>=0.2.2",

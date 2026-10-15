@@ -5,6 +5,8 @@ Run from the repo root:  uvicorn api.main:app --port 8000
 Endpoints
   GET  /healthz                    -> {ok, ai, kbs, budget, inst (8-hex id of this instance), up_s, ai_key
                                       ("ok" | "missing" | "rejected" | "unchecked"), restore (KB_SECRET set)}
+                                      + claude {model, on, day, spent_usd, cap_usd, in_flight_usd}, only when
+                                      ANTHROPIC_API_KEY is set
   GET  /api/examples               -> pre-indexed example sources (eval/fixtures) + starter questions,
                                       with the cached answer of each starter when the shared cache has one
   POST /api/kb                     -> JSON {url, max_pages?} or multipart PDFs (field "files")
@@ -33,7 +35,8 @@ Endpoints
           Fatal problems send only error{code, message} (codes: kb_expired, bad_request, server_error).
           kb_expired: the client re-reads the site from its saved URL (POST /api/kb) and asks again.
           notice codes (non-fatal, the answer still follows as passages): session_cap, ip_cap,
-          global_budget, ai_busy, ai_unavailable (the key is missing or rejected).
+          global_budget, ai_busy, ai_unavailable (no usable AI key: none set, or the OpenRouter key was rejected
+          and no Claude key is set).
           done.closest = {title, url} of the nearest page when the site does not answer (else null).
           Pinned examples: an exact cached question (starter or follow-up chip) is served from the cache mid-chat.
   POST /api/extract {kb_id, fields}  -> {kb_id, fields, rows:[{<label>: value, ..., source:{url, title}}],
@@ -83,12 +86,15 @@ bodies skip the CORS preflight, so CORS alone would not stop another site's page
 KB_MAX (40), MAX_PAGES (15), EXTRACT_MAX_PAGES (5), MAX_UPLOAD_MB (20), STARTER_ANSWERS (json file),
 TRUSTED_PROXY_HOPS (1: the per-IP caps use the X-Forwarded-For entry our proxy added, never the visitor's own),
 CLIENT_IP_HEADER (optional platform header with the visitor address), OPENROUTER_API_KEY (spaces/quotes trimmed),
+ANTHROPIC_API_KEY (optional: Claude Haiku 5.5 after the paid OpenRouter models, see llm.py), ANTHROPIC_DAILY_CAP (1.00
+USD per day and instance, counted from each Claude response's usage),
 KB_SECRET (32+ random bytes; needed for restore across instances), IP_RESTORE_CAP (60), JINA_API_KEY (optional),
 JINA_RPM (20), JS_MAX_PAGES (8; rendered pages count inside MAX_PAGES).
 WP_DEMO_ORIGINS (comma list, default https://playground.wordpress.net): origins allowed on POST /api/answer only
 (CORS preflight included), for the WordPress plugin's public demo. WP_SESSION_CAP, WP_IP_CAP, WP_DAILY_USD,
-WP_MAX_TOKENS: the caps of POST /api/answer (see above). The caps live in each instance's memory: the AI key's own
-credit limit at OpenRouter is the only hard stop across instances.
+WP_MAX_TOKENS: the caps of POST /api/answer (see above). The caps live in each instance's memory: the AI keys' own
+limits (the OpenRouter key's credit limit, the Anthropic workspace's spend limit) are the only hard stops across
+instances.
 Visit log: KV_REST_API_URL + KV_REST_API_TOKEN (or UPSTASH_REDIS_REST_URL + UPSTASH_REDIS_REST_TOKEN; none = in
 memory), STATS_KEY, HIT_IP_CAP (100), HIT_DAILY_CAP (3000) (both per instance).
 """
@@ -622,9 +628,12 @@ def create_app(*, stream=None, translate=None, complete=None, crawl=None, clock=
     @app.get("/healthz")
     def healthz():
         key = llm.key_state() if st.real_ai else "ok"
-        return {"ok": True, "ai": (llm.available() and key not in ("missing", "rejected")) if st.real_ai else True,
-                "kbs": len(st.kbs), "budget": st.budget.snapshot(), "wp_budget": st.wp_budget.snapshot(), "inst": st.inst,
-                "up_s": int(time.monotonic() - st.boot), "ai_key": key, "restore": bool(os.environ.get("KB_SECRET"))}
+        out = {"ok": True, "ai": llm.available() if st.real_ai else True,
+               "kbs": len(st.kbs), "budget": st.budget.snapshot(), "wp_budget": st.wp_budget.snapshot(), "inst": st.inst,
+               "up_s": int(time.monotonic() - st.boot), "ai_key": key, "restore": bool(os.environ.get("KB_SECRET"))}
+        if st.real_ai and llm.anthropic_key():  # only once ANTHROPIC_API_KEY is set: Claude's state and spend today
+            out["claude"] = llm.claude_snapshot()
+        return out
 
     @app.get("/api/examples")
     def examples():
@@ -1066,7 +1075,7 @@ def _chat_events(st, kb: KB, question: str, history: list[dict], session: str, i
                 res = run.result  # set before the text for no_match / cached / extractive / early error
                 if res is not None and res.status in ("extractive", "error") and res.note:
                     code = _REASON_BY_MESSAGE.get(res.note, "ai_busy")
-                    if code == "ai_busy" and st.real_ai and llm.key_state() in ("missing", "rejected"):
+                    if code == "ai_busy" and st.real_ai and not llm.available():
                         code = "ai_unavailable"
                     yield sse("notice", {"code": code, "message": res.note if code not in ("ai_busy", "ai_unavailable")
                                          else MESSAGES[code]})
@@ -1259,7 +1268,7 @@ def _wp_answer(st, req: dict, ip: str) -> JSONResponse:
     if res is None or res.status not in ("answered", "cached"):
         note = res.note if res is not None else ""
         code = _REASON_BY_MESSAGE.get(note, "ai_busy")
-        if code == "ai_busy" and st.real_ai and llm.key_state() in ("missing", "rejected"):
+        if code == "ai_busy" and st.real_ai and not llm.available():
             code = "ai_unavailable"
         message = note if code not in ("ai_busy", "ai_unavailable") else MESSAGES[code]
         return JSONResponse({"answer": message, "sources": sources, "mode": "extractive", "not_found": False,

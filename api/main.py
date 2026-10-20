@@ -79,6 +79,10 @@ Endpoints
        summaries, median_ms, clicks, top labels; leaves_in_period (None when the summaries cannot be read).
        Header X-Stats-Key must equal STATS_KEY (401 otherwise); without STATS_KEY the route answers 404.
        503 store_unavailable when the store cannot be read. CLI: scripts/visits.py.
+POST /api/gate   Tapemark phone-test report from slimanechanchoul.com/tm-gate/ (JSON {text, run, stage, build, model, query},
+       up to visits.MAX_GATE_BODY bytes; same Origin check, bot drop and per-IP cap as /api/hit; 204). Stored: the
+       report text, those labels, the User-Agent and the time; never the IP. Kept: the last visits.MAX_GATE.
+GET  /api/gate-results?limit=N   the newest reports, with the same x-stats-key header as /api/stats.
 
 Env: CORS_ORIGINS (comma list, default https://slimanechanchoul.com), CORS_ORIGIN_REGEX (default any
 http://localhost:* / 127.0.0.1:*); a POST whose Origin header matches neither gets 403 origin_not_allowed (text/plain
@@ -983,6 +987,47 @@ def create_app(*, stream=None, translate=None, complete=None, crawl=None, clock=
         if out is None:
             return _err("store_unavailable", status=503)
         return JSONResponse(out, headers=NO_STORE)
+
+    # ------------------------------------------------------------ Tapemark phone-test reports (slimanechanchoul.com/tm-gate/)
+
+    @app.post("/api/gate")
+    async def gate_report(request: Request):
+        origin = request.headers.get("origin")
+        if not origin or not origin_ok(origin):
+            return _err("origin_not_allowed", status=403)
+        if _declared_size(request) > visits_mod.MAX_GATE_BODY:
+            return _err("too_big", status=413)
+        raw = b""
+        async for chunk in request.stream():
+            raw += chunk
+            if len(raw) > visits_mod.MAX_GATE_BODY:
+                return _err("too_big", status=413)
+        body = _hit_json(raw)
+        if body is _NOT_JSON:
+            return _err("bad_request")
+        ua = request.headers.get("user-agent", "")
+        if visits_mod.is_bot(ua):
+            return Response(status_code=204, headers=NO_STORE)
+        report = visits_mod.make_gate(body, ua, st.clock())
+        if report is None:
+            return _err("bad_request")
+        if not st.hit_caps.take(client_ip(request)):  # the IP is used here only, never stored
+            return _err("hit_cap", status=429)
+        return Response(status_code=204, headers=NO_STORE,
+                        background=BackgroundTask(visits_mod.safe_add_gate, st.visits, report))
+
+    @app.get("/api/gate-results")
+    def gate_results(request: Request):
+        key = os.environ.get("STATS_KEY", "").strip()
+        if not key:
+            return JSONResponse({"detail": "Not Found"}, status_code=404)
+        given = request.headers.get("x-stats-key", "")
+        if not hmac.compare_digest(given.encode("utf-8"), key.encode("utf-8")):
+            return _err("unauthorized", status=401)
+        out = visits_mod.gate_reports(st.visits, _int_param(request.query_params.get("limit"), 50))
+        if out is None:
+            return _err("store_unavailable", status=503)
+        return JSONResponse({"results": out}, headers=NO_STORE)
 
     return app
 

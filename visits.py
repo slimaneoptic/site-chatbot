@@ -59,6 +59,10 @@ WRITE_TIMEOUT = (1.0, 2.0)  # (connect, read) seconds
 READ_TIMEOUT = (2.0, 8.0)
 EVENTS_KEY = "visits:events"
 DAY_KEY = "visits:day:"
+GATE_KEY = "gate:results"  # Tapemark phone-test reports (slimanechanchoul.com/tm-gate/), newest first
+MAX_GATE = 500             # reports kept
+MAX_GATE_BODY = 32768      # bytes of one report body
+MAX_GATE_TEXT = 24000      # chars of the report text kept
 LEAVE_KEY = "visits:leave"  # leave summaries (time on page, clicks), newest first, same length cap as the events
 TOP = 100                  # rows per "by_*" list in /api/stats
 MAX_LEAVE_BODY = 4096      # bytes of one leave summary; a page view stays at MAX_BODY
@@ -280,6 +284,7 @@ class MemoryStore:
         self._lock = threading.Lock()
         self._events: deque[str] = deque(maxlen=max_events)  # newest at the left, like LPUSH
         self._leaves: deque[str] = deque(maxlen=max_events)
+        self._gate: deque[str] = deque(maxlen=MAX_GATE)
         self._days: dict[str, Counter] = {}
 
     def add(self, event: dict) -> bool:
@@ -298,9 +303,15 @@ class MemoryStore:
             self._leaves.appendleft(json.dumps(event, ensure_ascii=False, separators=(",", ":")))
         return True
 
+    def add_gate(self, report: dict) -> bool:
+        with self._lock:
+            self._gate.appendleft(json.dumps(report, ensure_ascii=False, separators=(",", ":")))
+        return True
+
     def lrange(self, start: int, stop: int, key: str = EVENTS_KEY) -> list[str] | None:
         with self._lock:
-            return list(self._leaves if key == LEAVE_KEY else self._events)[start:stop + 1]
+            src = self._leaves if key == LEAVE_KEY else self._gate if key == GATE_KEY else self._events
+            return list(src)[start:stop + 1]
 
     def day_hashes(self, days: list[str]) -> list[dict[str, int]] | None:
         with self._lock:
@@ -362,6 +373,12 @@ class UpstashStore:
                 ["LTRIM", LEAVE_KEY, "0", str(self.max_events - 1)]]
         return self._pipeline(cmds, WRITE_TIMEOUT) is not None
 
+    def add_gate(self, report: dict) -> bool:
+        """A phone-test report: 2 commands, its own list, kept to MAX_GATE."""
+        cmds = [["LPUSH", GATE_KEY, json.dumps(report, ensure_ascii=False, separators=(",", ":"))],
+                ["LTRIM", GATE_KEY, "0", str(MAX_GATE - 1)]]
+        return self._pipeline(cmds, WRITE_TIMEOUT) is not None
+
     def lrange(self, start: int, stop: int, key: str = EVENTS_KEY) -> list[str] | None:
         out = self._pipeline([["LRANGE", key, str(start), str(stop)]], READ_TIMEOUT)
         if out is None or not isinstance(out[0], list):
@@ -408,6 +425,55 @@ def safe_add(store, event: dict) -> None:
             store.add(event)
     except Exception:  # noqa: BLE001
         pass
+
+
+# ---------------------------------------------------------------- Tapemark phone-test reports
+
+GATE_STAGES = ("final", "before-3d", "after-reload")
+_GATE_RUN = re.compile(r"[A-Za-z0-9-]{6,40}")
+
+
+def make_gate(body, ua: str, now: float) -> dict | None:
+    """One report from the phone-test page: the copied text plus a few labels. Never the IP. The page says on
+    screen that results are sent (device and test numbers only)."""
+    if not isinstance(body, dict):
+        return None
+    text = body.get("text")
+    if not isinstance(text, str) or not text.strip():
+        return None
+    stage = body.get("stage") if body.get("stage") in GATE_STAGES else "final"
+    run = body.get("run") if isinstance(body.get("run"), str) and _GATE_RUN.fullmatch(body.get("run")) else ""
+    return {
+        "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+        "run": run,
+        "stage": stage,
+        "build": _text(body.get("build"), 80),
+        "model": _text(body.get("model"), 60),
+        "query": _text(body.get("query"), 120),
+        "ua": _text(ua, 300),
+        "text": _SURROGATE.sub("", text)[:MAX_GATE_TEXT],
+    }
+
+
+def safe_add_gate(store, report: dict) -> None:
+    """Background task after the 204."""
+    try:
+        store.add_gate(report)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def gate_reports(store, limit: int = 50) -> list[dict] | None:
+    rows = store.lrange(0, max(0, min(limit, MAX_GATE)) - 1, key=GATE_KEY)
+    if rows is None:
+        return None
+    out = []
+    for r in rows:
+        try:
+            out.append(json.loads(r))
+        except ValueError:
+            pass
+    return out
 
 
 # ---------------------------------------------------------------- caps

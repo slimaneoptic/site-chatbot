@@ -39,7 +39,7 @@ def reports(store) -> list[dict]:
 def test_gate_stores_the_report_without_the_ip(monkeypatch):
     c, store, _ = make(monkeypatch)
     r = post(c)
-    assert r.status_code == 204
+    assert r.status_code == 200 and r.json() == {"ok": True}  # not 204: the page's coi service worker breaks on 204
     [rep] = reports(store)
     assert rep["text"] == TEXT and rep["stage"] == "final" and rep["run"] == "r-1a2b3c4d"
     assert rep["model"] == "iPhone 16 Pro Max" and rep["query"] == "?path=single&stop=first"
@@ -66,17 +66,17 @@ def test_gate_refuses_bad_bodies_and_big_ones(monkeypatch):
 
 def test_gate_cleans_labels_and_unknown_stage(monkeypatch):
     c, store, _ = make(monkeypatch)
-    assert post(c, payload=report(stage="weird", run="bad run id!", model="a\x00b" * 50)).status_code == 204
+    assert post(c, payload=report(stage="weird", run="bad run id!", model="a\x00b" * 50)).status_code == 200
     [rep] = reports(store)
     assert rep["stage"] == "final" and rep["run"] == "" and len(rep["model"]) <= 60 and "\x00" not in rep["model"]
 
 
 def test_gate_drops_bots_and_caps_per_ip(monkeypatch):
     c, store, _ = make(monkeypatch, HIT_IP_CAP=2)
-    assert post(c, ua="Googlebot/2.1 (+http://www.google.com/bot.html)").status_code == 204
+    assert post(c, ua="Googlebot/2.1 (+http://www.google.com/bot.html)").status_code == 200
     assert reports(store) == []
-    assert post(c, ua=CHROME).status_code == 204
-    assert post(c, ua=CHROME).status_code == 204
+    assert post(c, ua=CHROME).status_code == 200
+    assert post(c, ua=CHROME).status_code == 200
     assert post(c, ua=CHROME).status_code == 429
     assert len(reports(store)) == 2
 
@@ -110,5 +110,5 @@ def test_upstash_gate_list_is_capped_and_separate():
 def test_a_broken_store_never_breaks_the_gate_post(monkeypatch):
     s = visits.UpstashStore("https://x.upstash.io", "tok", post=FakeUpstash(fail="raise"))
     c, _, _ = make(monkeypatch, store=s)
-    assert post(c).status_code == 204
+    assert post(c).status_code == 200
     assert visits.gate_reports(s) is None

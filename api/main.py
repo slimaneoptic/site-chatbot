@@ -80,7 +80,7 @@ Endpoints
        Header X-Stats-Key must equal STATS_KEY (401 otherwise); without STATS_KEY the route answers 404.
        503 store_unavailable when the store cannot be read. CLI: scripts/visits.py.
 POST /api/gate   Tapemark phone-test report from slimanechanchoul.com/tm-gate/ (JSON {text, run, stage, build, model, query},
-       up to visits.MAX_GATE_BODY bytes; same Origin check, bot drop and per-IP cap as /api/hit; 204). Stored: the
+       up to visits.MAX_GATE_BODY bytes; same Origin check, bot drop and per-IP cap as /api/hit; 200 {"ok": true}). Stored: the
        report text, those labels, the User-Agent and the time; never the IP. Kept: the last visits.MAX_GATE.
 GET  /api/gate-results?limit=N   the newest reports, with the same x-stats-key header as /api/stats.
 
@@ -1007,14 +1007,16 @@ def create_app(*, stream=None, translate=None, complete=None, crawl=None, clock=
             return _err("bad_request")
         ua = request.headers.get("user-agent", "")
         if visits_mod.is_bot(ua):
-            return Response(status_code=204, headers=NO_STORE)
+            return JSONResponse({"ok": True}, headers=NO_STORE)  # dropped quietly, not stored
         report = visits_mod.make_gate(body, ua, st.clock())
         if report is None:
             return _err("bad_request")
         if not st.hit_caps.take(client_ip(request)):  # the IP is used here only, never stored
             return _err("hit_cap", status=429)
-        return Response(status_code=204, headers=NO_STORE,
-                        background=BackgroundTask(visits_mod.safe_add_gate, st.visits, report))
+        # 200 with a small body, not 204: the page's coi service worker rebuilds every response and turns a
+        # 204 into a network error (new Response(body, {status: 204}) throws), so the page could not tell it worked
+        return JSONResponse({"ok": True}, headers=NO_STORE,
+                            background=BackgroundTask(visits_mod.safe_add_gate, st.visits, report))
 
     @app.get("/api/gate-results")
     def gate_results(request: Request):
